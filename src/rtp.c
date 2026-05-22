@@ -56,10 +56,8 @@ static int rtp_encoder_encode_h264_single(RtpEncoder* rtp_encoder, uint8_t* buf,
   rtp_packet->header.timestamp = htonl(rtp_encoder->timestamp);
   rtp_packet->header.ssrc = htonl(rtp_encoder->ssrc);
 
-  // I frame and P frame
   if ((*buf & 0x1f) == 0x05 || (*buf & 0x1f) == 0x01) {
     rtp_packet->header.markerbit = 1;
-    rtp_encoder->timestamp += rtp_encoder->timestamp_increment;
   }
 #if 0
   LOGI("markbit: %d, timestamp: %d, nalu type: %d", rtp_packet->header.markerbit, rtp_encoder->timestamp, buf[0] & 0x1f);
@@ -85,11 +83,6 @@ static int rtp_encoder_encode_h264_fu_a(RtpEncoder* rtp_encoder, uint8_t* buf, s
   uint8_t nri = (buf[0] & 0x60) >> 5;
   buf = buf + 1;
   size = size - 1;
-
-  // increase timestamp if I, P frame
-  if (type == 0x05 || type == 0x01) {
-    rtp_encoder->timestamp += rtp_encoder->timestamp_increment;
-  }
 
   NaluHeader* fu_indicator = (NaluHeader*)rtp_packet->payload;
   FuHeader* fu_header = (FuHeader*)rtp_packet->payload + sizeof(NaluHeader);
@@ -178,6 +171,20 @@ static int rtp_encoder_encode_generic(RtpEncoder* rtp_encoder, uint8_t* buf, siz
   rtp_encoder->on_packet(rtp_encoder->buf, size + sizeof(RtpHeader), rtp_encoder->user_data);
 
   return 0;
+}
+
+void rtp_encoder_set_payload_type(RtpEncoder* rtp_encoder, uint8_t pt) {
+  if (!rtp_encoder) {
+    return;
+  }
+  rtp_encoder->type = pt;
+}
+
+void rtp_encoder_set_timestamp(RtpEncoder* rtp_encoder, uint32_t timestamp_90k) {
+  if (!rtp_encoder) {
+    return;
+  }
+  rtp_encoder->timestamp = timestamp_90k;
 }
 
 void rtp_encoder_init(RtpEncoder* rtp_encoder, MediaCodec codec, RtpOnPacket on_packet, void* user_data) {

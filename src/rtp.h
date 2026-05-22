@@ -21,6 +21,7 @@ typedef enum RtpPayloadType {
   PT_PCMA = 8,
   PT_G722 = 9,
   PT_H264 = 96,
+  PT_H264_RTX = 97,
   PT_OPUS = 111
 
 } RtpPayloadType;
@@ -28,6 +29,7 @@ typedef enum RtpPayloadType {
 typedef enum RtpSsrc {
 
   SSRC_H264 = 1,
+  SSRC_H264_RTX = 2,
   SSRC_PCMA = 4,
   SSRC_PCMU = 5,
   SSRC_OPUS = 6,
@@ -96,6 +98,12 @@ struct RtpEncoder {
 int rtp_packet_validate(uint8_t* packet, size_t size);
 
 void rtp_encoder_init(RtpEncoder* rtp_encoder, MediaCodec codec, RtpOnPacket on_packet, void* user_data);
+
+/** Override dynamic PT after parsing remote SDP (e.g. offer uses 97 for H264). */
+void rtp_encoder_set_payload_type(RtpEncoder* rtp_encoder, uint8_t pt);
+
+/** Set RTP timestamp (90 kHz) for the next H.264 access unit (all FU-A fragments share it). */
+void rtp_encoder_set_timestamp(RtpEncoder* rtp_encoder, uint32_t timestamp_90k);
 
 int rtp_encoder_encode(RtpEncoder* rtp_encoder, const uint8_t* data, size_t size);
 
