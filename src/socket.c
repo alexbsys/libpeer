@@ -56,7 +56,7 @@ int udp_socket_open(UdpSocket* udp_socket, int family, int port) {
   }
 
   if (udp_socket->fd < 0) {
-    LOGE("Failed to create socket");
+    LOGE("Failed to create socket errno=%d (%s)", errno, strerror(errno));
     return -1;
   }
 
@@ -95,8 +95,9 @@ int udp_socket_open(UdpSocket* udp_socket, int family, int port) {
 }
 
 void udp_socket_close(UdpSocket* udp_socket) {
-  if (udp_socket->fd > 0) {
+  if (udp_socket->fd >= 0) {
     close(udp_socket->fd);
+    udp_socket->fd = -1;
   }
 }
 

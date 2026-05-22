@@ -13,7 +13,7 @@ typedef struct StunAttribute StunAttribute;
 
 typedef struct StunMessage StunMessage;
 
-#define STUN_ATTR_BUF_SIZE 256
+#define STUN_ATTR_BUF_SIZE 512
 #define MAGIC_COOKIE 0x2112A442
 #define STUN_FINGERPRINT_XOR 0x5354554e
 
@@ -30,6 +30,8 @@ typedef enum StunMethod {
 
   STUN_METHOD_BINDING = 0x0001,
   STUN_METHOD_ALLOCATE = 0x0003,
+  STUN_METHOD_SEND = 0x0006,
+  STUN_METHOD_CREATE_PERMISSION = 0x0008,
 
 } StunMethod;
 
@@ -42,6 +44,8 @@ typedef enum StunAttrType {
   STUN_ATTR_TYPE_REALM = 0x0014,
   STUN_ATTR_TYPE_NONCE = 0x0015,
   STUN_ATTR_TYPE_XOR_RELAYED_ADDRESS = 0x0016,
+  STUN_ATTR_TYPE_XOR_PEER_ADDRESS = 0x0012,
+  STUN_ATTR_TYPE_DATA = 0x0013,
   STUN_ATTR_TYPE_REQUESTED_TRANSPORT = 0x0019,
   STUN_ATTR_TYPE_XOR_MAPPED_ADDRESS = 0x0020,
   STUN_ATTR_TYPE_PRIORITY = 0x0024,
@@ -85,6 +89,7 @@ struct StunAttribute {
 struct StunMessage {
   StunClass stunclass;
   StunMethod stunmethod;
+  uint8_t has_fingerprint;
   uint32_t fingerprint;
   char message_integrity[20];
   char username[128];
@@ -92,6 +97,10 @@ struct StunMessage {
   char nonce[64];
   Address mapped_addr;
   Address relayed_addr;
+  Address peer_addr;
+  int use_candidate;
+  uint8_t data[256];
+  int data_len;
   uint8_t buf[STUN_ATTR_BUF_SIZE];
   size_t size;
 };

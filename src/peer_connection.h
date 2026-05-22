@@ -115,7 +115,14 @@ int peer_connection_datachannel_send_sid(PeerConnection* pc, char* message, size
 
 int peer_connection_send_audio(PeerConnection* pc, const uint8_t* packet, size_t bytes);
 
-int peer_connection_send_video(PeerConnection* pc, const uint8_t* packet, size_t bytes);
+/**
+ * @param pts_us capture time in microseconds; when non-zero, mapped to RTP 90 kHz
+ *        clock (fixes browser playout delay drift vs fixed +3000/frame ticks).
+ */
+int peer_connection_send_video(PeerConnection* pc, const uint8_t* packet, size_t bytes, uint32_t pts_us);
+
+/** Drop NACK resends for RTP seq older than the latest IDR (see rtp_nack_cache). */
+void peer_connection_set_nack_discard_pre_idr(PeerConnection* pc, int enable);
 
 void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp, SdpType sdp_type);
 

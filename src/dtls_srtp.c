@@ -172,18 +172,8 @@ int dtls_srtp_init(DtlsSrtp* dtls_srtp, DtlsSrtpRole role, void* user_data) {
 #endif
   dtls_srtp_selfsign_cert(dtls_srtp);
 
-  mbedtls_ssl_conf_verify(&dtls_srtp->conf, dtls_srtp_cert_verify, NULL);
-
-  mbedtls_ssl_conf_authmode(&dtls_srtp->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
-
-  mbedtls_ssl_conf_ca_chain(&dtls_srtp->conf, &dtls_srtp->cert, NULL);
-
-  mbedtls_ssl_conf_own_cert(&dtls_srtp->conf, &dtls_srtp->cert, &dtls_srtp->pkey);
-
-  mbedtls_ssl_conf_rng(&dtls_srtp->conf, mbedtls_ctr_drbg_random, &dtls_srtp->ctr_drbg);
-
-  mbedtls_ssl_conf_read_timeout(&dtls_srtp->conf, 1000);
-
+  /* mbedtls_ssl_config_defaults() resets parts of \c conf; apply certs/RNG/auth
+   * only after it (mbedTLS program examples use this order). */
   if (dtls_srtp->role == DTLS_SRTP_ROLE_SERVER) {
     mbedtls_ssl_config_defaults(&dtls_srtp->conf,
                                 MBEDTLS_SSL_IS_SERVER,
@@ -203,6 +193,17 @@ int dtls_srtp_init(DtlsSrtp* dtls_srtp, DtlsSrtpRole role, void* user_data) {
                                 MBEDTLS_SSL_PRESET_DEFAULT);
   }
 
+  /* WebRTC: trust is a=fingerprint:sha-256 in SDP (checked in dtls_srtp_handshake()).
+   * After defaults, client preset uses VERIFY_REQUIRED and can hit
+   * MBEDTLS_ERR_SSL_CERTIFICATE_VERIFICATION_WITHOUT_HOSTNAME (-0x5d80) without
+   * mbedtls_ssl_set_hostname(); we use OPTIONAL plus hostname on client below. */
+  mbedtls_ssl_conf_verify(&dtls_srtp->conf, dtls_srtp_cert_verify, NULL);
+  mbedtls_ssl_conf_authmode(&dtls_srtp->conf, MBEDTLS_SSL_VERIFY_OPTIONAL);
+  mbedtls_ssl_conf_ca_chain(&dtls_srtp->conf, &dtls_srtp->cert, NULL);
+  mbedtls_ssl_conf_own_cert(&dtls_srtp->conf, &dtls_srtp->cert, &dtls_srtp->pkey);
+  mbedtls_ssl_conf_rng(&dtls_srtp->conf, mbedtls_ctr_drbg_random, &dtls_srtp->ctr_drbg);
+  mbedtls_ssl_conf_read_timeout(&dtls_srtp->conf, 1000);
+
   dtls_srtp_x509_digest(&dtls_srtp->cert, dtls_srtp->local_fingerprint);
 
   LOGD("local fingerprint: %s", dtls_srtp->local_fingerprint);
@@ -214,6 +215,11 @@ int dtls_srtp_init(DtlsSrtp* dtls_srtp, DtlsSrtpRole role, void* user_data) {
   mbedtls_ssl_conf_cert_req_ca_list(&dtls_srtp->conf, MBEDTLS_SSL_CERT_REQ_CA_LIST_DISABLED);
 
   mbedtls_ssl_setup(&dtls_srtp->ssl, &dtls_srtp->conf);
+
+  if (dtls_srtp->role != DTLS_SRTP_ROLE_SERVER) {
+    /* Satisfy mbedTLS hostname check when acting as DTLS client (rare here). */
+    (void)mbedtls_ssl_set_hostname(&dtls_srtp->ssl, "webrtc");
+  }
 
   return 0;
 }
@@ -389,6 +395,42 @@ static int dtls_srtp_do_handshake(DtlsSrtp* dtls_srtp) {
   return ret;
 }
 
+/** Compare SDP a=fingerprint hex (with colons) to mbedTLS digest string; ignore separators and A–F case. */
+static int dtls_sha256_fingerprint_equal(const char* a, const char* b) {
+  while (*a && *b) {
+    while (*a == ':' || *a == ' ' || *a == '-') {
+      a++;
+    }
+    while (*b == ':' || *b == ' ' || *b == '-') {
+      b++;
+    }
+    if (*a == '\0' && *b == '\0') {
+      return 1;
+    }
+    if (*a == '\0' || *b == '\0') {
+      return 0;
+    }
+    char ca = *a++;
+    char cb = *b++;
+    if (ca >= 'A' && ca <= 'F') {
+      ca = (char)(ca - 'A' + 'a');
+    }
+    if (cb >= 'A' && cb <= 'F') {
+      cb = (char)(cb - 'A' + 'a');
+    }
+    if (ca != cb) {
+      return 0;
+    }
+  }
+  while (*a && (*a == ':' || *a == ' ' || *a == '-')) {
+    a++;
+  }
+  while (*b && (*b == ':' || *b == ' ' || *b == '-')) {
+    b++;
+  }
+  return *a == '\0' && *b == '\0';
+}
+
 static int dtls_srtp_handshake_server(DtlsSrtp* dtls_srtp) {
   int ret;
 
@@ -446,7 +488,7 @@ int dtls_srtp_handshake(DtlsSrtp* dtls_srtp, Address* addr) {
   if ((remote_crt = mbedtls_ssl_get_peer_cert(&dtls_srtp->ssl)) != NULL) {
     dtls_srtp_x509_digest(remote_crt, dtls_srtp->actual_remote_fingerprint);
 
-    if (strncmp(dtls_srtp->remote_fingerprint, dtls_srtp->actual_remote_fingerprint, DTLS_SRTP_FINGERPRINT_LENGTH) != 0) {
+    if (!dtls_sha256_fingerprint_equal(dtls_srtp->remote_fingerprint, dtls_srtp->actual_remote_fingerprint)) {
       LOGE("Actual and Expected Fingerprint mismatch: %s %s",
            dtls_srtp->remote_fingerprint,
            dtls_srtp->actual_remote_fingerprint);
@@ -454,7 +496,14 @@ int dtls_srtp_handshake(DtlsSrtp* dtls_srtp, Address* addr) {
     }
 
   } else {
-    LOGE("no remote fingerprint");
+    if (ret != 0) {
+      LOGE("no peer certificate after DTLS handshake (mbedtls ret=-0x%.4x); SDP fingerprint was not verified",
+           (unsigned int)-ret);
+    } else if (strlen(dtls_srtp->remote_fingerprint) == 0) {
+      LOGE("no peer certificate and no a=fingerprint:sha-256 in remote SDP");
+    } else {
+      LOGE("no peer certificate after DTLS handshake (unexpected)");
+    }
     return -1;
   }
 

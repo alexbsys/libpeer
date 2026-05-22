@@ -143,11 +143,17 @@ void stun_parse_msg_buf(StunMessage* msg) {
     msg->stunclass = STUN_CLASS_REQUEST;
   }
 
+  msg->has_fingerprint = 0;
+
   msg->stunmethod = ntohs(header->type) & 0x0FFF;
   if ((msg->stunmethod & STUN_METHOD_ALLOCATE) == STUN_METHOD_ALLOCATE) {
     msg->stunmethod = STUN_METHOD_ALLOCATE;
   } else if ((msg->stunmethod & STUN_METHOD_BINDING) == STUN_METHOD_BINDING) {
     msg->stunmethod = STUN_METHOD_BINDING;
+  } else if ((msg->stunmethod & STUN_METHOD_SEND) == STUN_METHOD_SEND) {
+    msg->stunmethod = STUN_METHOD_SEND;
+  } else if ((msg->stunmethod & STUN_METHOD_CREATE_PERMISSION) == STUN_METHOD_CREATE_PERMISSION) {
+    msg->stunmethod = STUN_METHOD_CREATE_PERMISSION;
   }
 
   while (pos < length) {
@@ -200,21 +206,41 @@ void stun_parse_msg_buf(StunMessage* msg) {
         break;
       case STUN_ATTR_TYPE_PRIORITY:
         break;
+      case STUN_ATTR_TYPE_XOR_PEER_ADDRESS:
+        *((uint32_t*)mask) = htonl(MAGIC_COOKIE);
+        memcpy(mask + 4, header->transaction_id, sizeof(header->transaction_id));
+        stun_get_mapped_address(attr->value, mask, &msg->peer_addr);
+        break;
+      case STUN_ATTR_TYPE_DATA:
+        msg->data_len = ntohs(attr->length);
+        if (msg->data_len > (int)sizeof(msg->data)) {
+          msg->data_len = (int)sizeof(msg->data);
+        }
+        memcpy(msg->data, attr->value, (size_t)msg->data_len);
+        break;
       case STUN_ATTR_TYPE_USE_CANDIDATE:
-        // LOGD("Use Candidate");
+        msg->use_candidate = 1;
         break;
       case STUN_ATTR_TYPE_FINGERPRINT:
+        msg->has_fingerprint = 1;
         memcpy(&msg->fingerprint, attr->value, ntohs(attr->length));
         // LOGD("Fingerprint: 0x%.4x", msg->fingerprint);
         break;
       case STUN_ATTR_TYPE_ICE_CONTROLLED:
       case STUN_ATTR_TYPE_ICE_CONTROLLING:
       case STUN_ATTR_TYPE_NETWORK_COST:
+      case STUN_ATTR_TYPE_SOFTWARE:
         // Do nothing
         break;
-      default:
-        LOGE("Unknown Attribute Type: 0x%04x", ntohs(attr->type));
+      default: {
+        uint16_t t = ntohs(attr->type);
+        /* RFC 5389: comprehension-optional attributes use type 0x8000–0xFFFF */
+        if (t & 0x8000) {
+          break;
+        }
+        LOGD("Unknown STUN attribute (required range): 0x%04x", t);
         break;
+      }
     }
 
     pos += 4 * ((ntohs(attr->length) + 3) / 4) + sizeof(StunAttribute);
@@ -353,6 +379,7 @@ StunMsgType stun_is_stun_msg(uint8_t *buf, size_t size) {
 #endif
 int stun_msg_is_valid(uint8_t* buf, size_t size, char* password) {
   StunMessage msg;
+  memset(&msg, 0, sizeof(msg));
 
   memcpy(msg.buf, buf, size);
 
@@ -360,24 +387,27 @@ int stun_msg_is_valid(uint8_t* buf, size_t size, char* password) {
 
   StunHeader* header = (StunHeader*)msg.buf;
 
-  // FINGERPRINT
-  uint32_t fingerprint = 0;
-  size_t length = size - 4 - sizeof(StunAttribute);
-  stun_calculate_fingerprint((char*)msg.buf, length, &fingerprint);
-  // LOGD("Fingerprint: 0x%08x", fingerprint);
-
-  if (fingerprint != msg.fingerprint) {
-    // LOGE("Fingerprint does not match.");
-    return -1;
-  } else {
-    // LOGD("Fingerprint matches.");
+  /* RFC 5245 ICE uses short-term credentials; Binding responses omit FINGERPRINT. */
+  size_t length = size;
+  if (msg.has_fingerprint) {
+    uint32_t fingerprint = 0;
+    length = size - 4 - sizeof(StunAttribute);
+    stun_calculate_fingerprint((char*)msg.buf, length, &fingerprint);
+    if (fingerprint != msg.fingerprint) {
+      return -1;
+    }
   }
 
   // MESSAGE-INTEGRITY
   unsigned char message_integrity_hex[41];
   unsigned char message_integrity[20];
-  header->length = htons(ntohs(header->length) - 4 - sizeof(StunAttribute));
-  length = length - 20 - sizeof(StunAttribute);
+  if (msg.has_fingerprint) {
+    header->length = htons(ntohs(header->length) - 4 - sizeof(StunAttribute));
+    length = length - 20 - sizeof(StunAttribute);
+  } else {
+    length = size - 20 - sizeof(StunAttribute);
+    header->length = htons(ntohs(header->length) - 20 - sizeof(StunAttribute));
+  }
   utils_get_hmac_sha1((char*)msg.buf, length, password, strlen(password), message_integrity);
   for (int i = 0; i < 20; i++) {
     sprintf((char*)&message_integrity_hex[2 * i], "%02x", (uint8_t)message_integrity[i]);
