@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,11 +11,14 @@
 #include "ports.h"
 #include "socket.h"
 #include "stun.h"
+#include "stun_tcp.h"
 #include "utils.h"
 
 #define AGENT_POLL_TIMEOUT 1
-#define AGENT_CONNCHECK_MAX 150
-#define AGENT_CONNCHECK_PERIOD 2
+#define AGENT_CONNCHECK_MAX 400
+/* Outbound connectivity-check spacing (peer_connection_loop ticks between sends).
+ * Was 2 (~20 ms with 10 ms loop); 6 ≈ 60 ms — enough on LAN, less CPU during CHECKING. */
+#define AGENT_CONNCHECK_PERIOD 6
 #define AGENT_TURN_MAX_PERMISSIONS 16
 /* ICE may multiplex Binding requests on the TURN socket; drain until the
  * CreatePermission *response* for our transaction_id (not the first STUN). */
@@ -23,8 +27,16 @@
  * effective minimum is often ~20 ms, so 1000 tries ≈ 20 s per STUN/TURN
  * round-trip — observed blocking ICE gather for 40+ s across servers. */
 #define AGENT_STUN_RECV_MAXTIMES 25
+#define AGENT_TURN_TCP_RECV_MAXTIMES 80
+#define AGENT_TURN_CB_RECV_MS 200
+#define AGENT_TURN_CB_WAIT_MS 800
 
 static void agent_process_inbound_stun(Agent* agent, StunMessage* stun_msg, Address* addr);
+static int agent_turn_channel_to_peer(Agent* agent, uint16_t channel, Address* peer);
+static void agent_turn_cb_try_finish_from_response(Agent* agent, StunMessage* stun_msg);
+static int agent_turn_process_udp_datagram(Agent* agent, Address* addr, uint8_t* buf, int len);
+static int agent_turn_tcp_poll_recv(Agent* agent, StunMessage* stun_msg);
+static void agent_turn_tcp_drain_media(Agent* agent, int wait_ms);
 
 /* RFC 8489: STUN password is the pwd of the ufrag that appears first in USERNAME. */
 static const char* agent_stun_password_for_msg(Agent* agent, const StunMessage* stun_msg) {
@@ -47,13 +59,25 @@ static const char* agent_stun_password_for_msg(Agent* agent, const StunMessage* 
 }
 
 void agent_clear_candidates(Agent* agent) {
+  if (agent->turn_tcp.fd >= 0) {
+    tcp_socket_close(&agent->turn_tcp);
+  }
   agent->local_candidates_count = 0;
   agent->remote_candidates_count = 0;
   agent->candidate_pairs_num = 0;
+  agent->nominated_pair = NULL;
+  agent->selected_pair = NULL;
   agent->turn_allocated = 0;
+  agent->turn_use_tcp = 0;
+  agent->turn_tcp.fd = -1;
   agent->turn_permissions_count = 0;
+  agent->turn_channels_count = 0;
+  agent->turn_next_channel = STUN_CHANNEL_NUMBER_MIN;
   agent->turn_cp_pending = 0;
+  agent->turn_cb_pending = 0;
+  agent->turn_cb_ok = 0;
   memset(agent->turn_cp_tid, 0, sizeof(agent->turn_cp_tid));
+  memset(agent->turn_cb_tid, 0, sizeof(agent->turn_cb_tid));
   memset(&agent->turn_server, 0, sizeof(agent->turn_server));
   memset(&agent->turn_relay_addr, 0, sizeof(agent->turn_relay_addr));
 }
@@ -79,19 +103,28 @@ int agent_create(Agent* agent) {
 #endif
 
   agent_clear_candidates(agent);
+  agent->turn_tcp.fd = -1;
+  agent->turn_use_tcp = 0;
   memset(agent->remote_ufrag, 0, sizeof(agent->remote_ufrag));
   memset(agent->remote_upwd, 0, sizeof(agent->remote_upwd));
   return 0;
 }
 
 void agent_destroy(Agent* agent) {
+  if (agent->turn_tcp.fd >= 0) {
+    tcp_socket_close(&agent->turn_tcp);
+    agent->turn_tcp.fd = -1;
+  }
+  agent->turn_use_tcp = 0;
   if (agent->udp_sockets[0].fd >= 0) {
     udp_socket_close(&agent->udp_sockets[0]);
+    agent->udp_sockets[0].fd = -1;
   }
 
 #if CONFIG_IPV6
   if (agent->udp_sockets[1].fd >= 0) {
     udp_socket_close(&agent->udp_sockets[1]);
+    agent->udp_sockets[1].fd = -1;
   }
 #endif
 }
@@ -161,6 +194,39 @@ static int agent_socket_send(Agent* agent, Address* addr, const uint8_t* buf, in
   return -1;
 }
 
+static int agent_turn_control_send(Agent* agent, const uint8_t* buf, int len) {
+  if (agent->turn_use_tcp && agent->turn_tcp.fd >= 0) {
+    return stun_tcp_send(&agent->turn_tcp, buf, len);
+  }
+  return agent_socket_send(agent, &agent->turn_server, buf, len);
+}
+
+static int agent_turn_control_recv_attempts(Agent* agent, StunMessage* recv_msg, int maxtimes) {
+  int ret = -1;
+  int i;
+  if (agent->turn_use_tcp && agent->turn_tcp.fd >= 0) {
+    int tcp_max = (maxtimes > 0) ? maxtimes : AGENT_TURN_TCP_RECV_MAXTIMES;
+    if (tcp_max > AGENT_TURN_TCP_RECV_MAXTIMES) {
+      tcp_max = AGENT_TURN_TCP_RECV_MAXTIMES;
+    }
+    for (i = 0; i < tcp_max; i++) {
+      ret = stun_tcp_recv_packet(&agent->turn_tcp, recv_msg->buf, (int)sizeof(recv_msg->buf));
+      if (ret > 0) {
+        recv_msg->size = ret;
+        return ret;
+      }
+      if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        continue;
+      }
+      if (ret < 0) {
+        return ret;
+      }
+    }
+    return 0;
+  }
+  return agent_socket_recv_attempts(agent, NULL, recv_msg->buf, (int)sizeof(recv_msg->buf), maxtimes);
+}
+
 static int agent_addr_same(const Address* a, const Address* b) {
   char sa[ADDRSTRLEN];
   char sb[ADDRSTRLEN];
@@ -200,6 +266,26 @@ static int agent_ipv4_is_site_local(const Address* addr) {
 /* Same broadcast domain as ESP (e.g. 192.168.60.x + 192.168.61.x with mask 255.255.254.0). */
 static int agent_ipv4_same_lan23(uint32_t a, uint32_t b) {
   return (a & 0xFFFFFE00u) == (b & 0xFFFFFE00u);
+}
+
+/** True when media ICE pair is already up and this Binding is from the same remote. */
+static int agent_inbound_from_selected_pair(const Agent* agent, const Address* addr) {
+  const IceCandidatePair* sel = agent->selected_pair;
+  if (!sel || sel->state != ICE_CANDIDATE_STATE_SUCCEEDED || !sel->remote || !addr) {
+    return 0;
+  }
+  if (agent_addr_same(&sel->remote->addr, addr)) {
+    return 1;
+  }
+  if (sel->remote->type == ICE_CANDIDATE_TYPE_HOST && sel->remote->addr.family == AF_INET &&
+      addr->family == AF_INET) {
+    uint32_t rip = ntohl(sel->remote->addr.sin.sin_addr.s_addr);
+    uint32_t aip = ntohl(addr->sin.sin_addr.s_addr);
+    if (agent_ipv4_same_lan23(rip, aip) && sel->remote->addr.port == addr->port) {
+      return 1;
+    }
+  }
+  return 0;
 }
 
 /* Drop remote RFC1918 host on another LAN segment (VMware 192.168.56.x, etc.). */
@@ -304,7 +390,7 @@ static int agent_turn_create_permission(Agent* agent, Address* peer) {
   agent->turn_cp_peer = *peer;
   agent->turn_cp_pending = 1;
 
-  ret = agent_socket_send(agent, &agent->turn_server, send_msg.buf, send_msg.size);
+  ret = agent_turn_control_send(agent, send_msg.buf, send_msg.size);
   if (ret < 0) {
     agent->turn_cp_pending = 0;
     return -1;
@@ -319,22 +405,371 @@ static int agent_turn_create_permission(Agent* agent, Address* peer) {
   addr_to_string(peer, addr_string, sizeof(addr_string));
   LOGI("TURN permission (optimistic) for %s:%d", addr_string, peer->port);
 
-  Address raddr;
+  uint8_t drain_buf[1400];
   for (int drain = 0; drain < 4; drain++) {
-    memset(&recv_msg, 0, sizeof(recv_msg));
-    ret = agent_socket_recv_attempts(agent, &raddr, recv_msg.buf, sizeof(recv_msg.buf), 3);
+    if (agent_recv(agent, drain_buf, sizeof(drain_buf)) != 0) {
+      break;
+    }
+  }
+  agent->turn_cp_pending = 0;
+  return 0;
+}
+
+static int agent_addr_is_turn_server(const Agent* agent, const Address* addr) {
+  char sa[ADDRSTRLEN];
+  char sb[ADDRSTRLEN];
+  if (!agent->turn_allocated || !addr) {
+    return 0;
+  }
+  if (addr->port != agent->turn_server.port) {
+    return 0;
+  }
+  addr_to_string(addr, sa, sizeof(sa));
+  addr_to_string(&agent->turn_server, sb, sizeof(sb));
+  return strcmp(sa, sb) == 0;
+}
+
+static void agent_turn_process_channel_payload(Agent* agent, uint16_t channel, const uint8_t* payload,
+                                               int plen) {
+  Address peer;
+  char peer_str[ADDRSTRLEN];
+
+  if (!agent_turn_channel_to_peer(agent, channel, &peer)) {
+    LOGW("TURN ChannelData unknown ch=0x%04x (%d B)", (unsigned)channel, plen);
+    return;
+  }
+  addr_to_string(&peer, peer_str, sizeof(peer_str));
+  LOGI("TURN ChannelData %d B from peer %s:%d (ch=0x%04x)", plen, peer_str, peer.port, (unsigned)channel);
+  if (plen > 0 && stun_probe((uint8_t*)payload, (size_t)plen) == 0) {
+    StunMessage inner;
+    memset(&inner, 0, sizeof(inner));
+    memcpy(inner.buf, payload, (size_t)plen);
+    inner.size = (size_t)plen;
+    stun_parse_msg_buf(&inner);
+    agent_process_inbound_stun(agent, &inner, &peer);
+  }
+}
+
+static void agent_turn_drain_udp(Agent* agent) {
+  uint8_t buf[1400];
+  Address addr;
+  int i;
+  int ret;
+
+  if (agent->turn_use_tcp || !agent->turn_allocated) {
+    return;
+  }
+  for (i = 0; i < 24; i++) {
+    ret = agent_socket_recv(agent, &addr, buf, (int)sizeof(buf));
     if (ret <= 0) {
       break;
     }
-    if (!stun_probe(recv_msg.buf, (size_t)ret)) {
-      continue;
-    }
-    recv_msg.size = (size_t)ret;
-    stun_parse_msg_buf(&recv_msg);
-    agent_turn_cp_try_finish_from_response(agent, &recv_msg);
-    agent_process_inbound_stun(agent, &recv_msg, &raddr);
+    agent_turn_process_udp_datagram(agent, &addr, buf, ret);
   }
-  agent->turn_cp_pending = 0;
+}
+
+static int agent_turn_udp_send_channel_data(Agent* agent, uint16_t channel, const uint8_t* data, int len) {
+  uint8_t frame[STUN_ATTR_BUF_SIZE + 4];
+  int total;
+
+  total = stun_pack_channel_data(frame, (int)sizeof(frame), channel, data, len);
+  if (total < 0) {
+    return -1;
+  }
+  return agent_socket_send(agent, &agent->turn_server, frame, total);
+}
+
+static int agent_turn_dispatch_stun_msg(Agent* agent, StunMessage* stun_msg, Address* addr) {
+  agent_turn_cb_try_finish_from_response(agent, stun_msg);
+  agent_turn_cp_try_finish_from_response(agent, stun_msg);
+  if (!agent->turn_cb_pending || stun_msg->stunmethod != STUN_METHOD_CHANNEL_BIND ||
+      stun_msg->stunclass != STUN_CLASS_RESPONSE) {
+    agent_process_inbound_stun(agent, stun_msg, addr);
+  }
+  return 1;
+}
+
+static int agent_turn_process_udp_datagram(Agent* agent, Address* addr, uint8_t* buf, int len) {
+  uint16_t channel;
+  int plen;
+
+  if (!agent->turn_allocated) {
+    return 0;
+  }
+  if (stun_is_channel_data_prefix(buf, len, &channel, &plen)) {
+    agent_turn_process_channel_payload(agent, channel, buf + 4, plen);
+    return 1;
+  }
+  if (stun_probe(buf, (size_t)len) != 0) {
+    return 0;
+  }
+  if (!agent_addr_is_turn_server(agent, addr)) {
+    return 0;
+  }
+  {
+    StunMessage stun_msg;
+    memset(&stun_msg, 0, sizeof(stun_msg));
+    memcpy(stun_msg.buf, buf, (size_t)len);
+    stun_msg.size = (size_t)len;
+    stun_parse_msg_buf(&stun_msg);
+    return agent_turn_dispatch_stun_msg(agent, &stun_msg, addr);
+  }
+}
+
+static int agent_turn_channel_to_peer(Agent* agent, uint16_t channel, Address* peer) {
+  int i;
+  for (i = 0; i < agent->turn_channels_count; i++) {
+    if (agent->turn_channels[i].number == channel) {
+      *peer = agent->turn_channels[i].peer;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Read one STUN or ChannelData frame on the TURN/TCP socket (blocking up to SO_RCVTIMEO). */
+static int agent_turn_tcp_read_next(Agent* agent, StunMessage* msg, int* is_channel,
+                                    uint16_t* channel_number) {
+  if (!agent->turn_use_tcp || agent->turn_tcp.fd < 0) {
+    return -1;
+  }
+  return stun_tcp_recv_turn_frame(&agent->turn_tcp, msg->buf, (int)sizeof(msg->buf), is_channel,
+                                  channel_number);
+}
+
+static void agent_turn_cb_try_finish_from_response(Agent* agent, StunMessage* stun_msg) {
+  int i;
+
+  if (stun_msg->stunmethod != STUN_METHOD_CHANNEL_BIND) {
+    return;
+  }
+  if (!agent->turn_cb_pending) {
+    StunHeader* lh;
+    if (stun_msg->stunclass != STUN_CLASS_RESPONSE) {
+      return;
+    }
+    lh = (StunHeader*)stun_msg->buf;
+    if (memcmp(lh->transaction_id, agent->turn_cb_tid, sizeof(agent->turn_cb_tid)) != 0) {
+      return;
+    }
+    for (i = 0; i < agent->turn_channels_count; i++) {
+      if (agent->turn_channels[i].number == agent->turn_cb_channel) {
+        agent->turn_channels[i].bound = 1;
+        LOGI("TURN ChannelBind late OK ch=0x%04x", (unsigned)agent->turn_channels[i].number);
+        return;
+      }
+    }
+    return;
+  }
+  StunHeader* h = (StunHeader*)stun_msg->buf;
+  if (memcmp(h->transaction_id, agent->turn_cb_tid, sizeof(agent->turn_cb_tid)) != 0) {
+    return;
+  }
+  agent->turn_cb_pending = 0;
+  if (stun_msg->stunclass == STUN_CLASS_ERROR) {
+    agent->turn_cb_ok = -1;
+    if (stun_msg->error_code != 0) {
+      LOGW("TURN ChannelBind STUN error %d %s", stun_msg->error_code, stun_msg->error_reason);
+    } else {
+      LOGW("TURN ChannelBind STUN error");
+    }
+    return;
+  }
+  if (stun_msg->stunclass != STUN_CLASS_RESPONSE) {
+    agent->turn_cb_ok = -1;
+    return;
+  }
+  agent->turn_cb_ok = 1;
+  for (i = 0; i < agent->turn_channels_count; i++) {
+    if (agent->turn_channels[i].number == agent->turn_cb_channel) {
+      Address* p = &agent->turn_channels[i].peer;
+      agent->turn_channels[i].bound = 1;
+      if (!agent_turn_has_permission(agent, p) &&
+          agent->turn_permissions_count < AGENT_TURN_MAX_PERMISSIONS) {
+        agent->turn_permissions[agent->turn_permissions_count++] = *p;
+      }
+      char addr_string[ADDRSTRLEN];
+      addr_to_string(p, addr_string, sizeof(addr_string));
+      LOGI("TURN ChannelBind 0x%04x for %s:%d", (unsigned)agent->turn_cb_channel, addr_string, p->port);
+      return;
+    }
+  }
+}
+
+static int agent_turn_channel_bind_req(Agent* agent, Address* peer, uint16_t channel) {
+  StunMessage send_msg;
+  StunMessage recv_msg;
+  char xor_peer[32];
+  uint16_t ch_fields[2];
+  int xor_len;
+  int ret;
+  int i;
+
+  memset(&send_msg, 0, sizeof(send_msg));
+  memset(&recv_msg, 0, sizeof(recv_msg));
+  stun_msg_create(&send_msg, STUN_CLASS_REQUEST | STUN_METHOD_CHANNEL_BIND);
+  /* coturn stun_attr_add_channel_number_str: 4-byte value, channel in first uint16 (BE). */
+  ch_fields[0] = htons(channel);
+  ch_fields[1] = 0;
+  stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_CHANNEL_NUMBER, sizeof(ch_fields), (char*)ch_fields);
+  xor_len = agent_turn_write_xor_peer(xor_peer, peer, (StunHeader*)send_msg.buf);
+  stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_XOR_PEER_ADDRESS, xor_len, xor_peer);
+  stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_USERNAME, strlen(agent->turn_username),
+                      agent->turn_username);
+  stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_REALM, strlen(agent->turn_realm), agent->turn_realm);
+  stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_NONCE, strlen(agent->turn_nonce), agent->turn_nonce);
+  stun_msg_finish(&send_msg, STUN_CREDENTIAL_LONG_TERM, agent->turn_password,
+                  strlen(agent->turn_password));
+
+  memcpy(agent->turn_cb_tid, ((StunHeader*)send_msg.buf)->transaction_id, sizeof(agent->turn_cb_tid));
+  agent->turn_cb_channel = channel;
+  agent->turn_cb_pending = 1;
+  agent->turn_cb_ok = 0;
+
+  ret = agent_turn_control_send(agent, send_msg.buf, send_msg.size);
+  if (ret < 0) {
+    agent->turn_cb_pending = 0;
+    return -1;
+  }
+
+#if CONFIG_TURN_TCP
+  if (agent->turn_use_tcp && agent->turn_tcp.fd >= 0) {
+    tcp_socket_set_recv_timeout_ms(&agent->turn_tcp, AGENT_TURN_CB_RECV_MS);
+  }
+#endif
+  {
+    const int wait_ms = agent->turn_use_tcp ? AGENT_TURN_CB_WAIT_MS : 800;
+    for (i = 0; agent->turn_cb_pending && i * 50 < wait_ms; i++) {
+#if CONFIG_TURN_TCP
+      if (agent->turn_use_tcp && agent->turn_tcp.fd >= 0) {
+        fd_set rfds;
+        struct timeval tv;
+        FD_ZERO(&rfds);
+        FD_SET(agent->turn_tcp.fd, &rfds);
+        tv.tv_sec = 0;
+        tv.tv_usec = 50000;
+        if (select(agent->turn_tcp.fd + 1, &rfds, NULL, NULL, &tv) <= 0) {
+          continue;
+        }
+      } else
+#endif
+      {
+        ports_sleep_ms(50);
+      }
+      for (int pass = 0; agent->turn_cb_pending && pass < 12; pass++) {
+        memset(&recv_msg, 0, sizeof(recv_msg));
+        ret = agent_turn_control_recv_attempts(agent, &recv_msg, 1);
+        if (ret <= 0) {
+          break;
+        }
+        recv_msg.size = (size_t)ret;
+        stun_parse_msg_buf(&recv_msg);
+        {
+          Address from = agent->turn_server;
+          agent_turn_dispatch_stun_msg(agent, &recv_msg, &from);
+        }
+      }
+      if (!agent->turn_use_tcp) {
+        agent_turn_drain_udp(agent);
+      }
+    }
+  }
+#if CONFIG_TURN_TCP
+  if (agent->turn_use_tcp && agent->turn_tcp.fd >= 0) {
+    tcp_socket_set_recv_timeout_ms(&agent->turn_tcp, 50);
+  }
+#endif
+  if (!agent->turn_cb_pending) {
+    return agent->turn_cb_ok == 1 ? 0 : -1;
+  }
+  if (agent->turn_cb_ok == -1) {
+    agent->turn_cb_pending = 0;
+    return -1;
+  }
+  /* Coturn may accept the bind but the success STUN reply can arrive after the wait window. */
+  agent->turn_cb_pending = 0;
+  for (i = 0; i < agent->turn_channels_count; i++) {
+    if (agent->turn_channels[i].number == channel) {
+      agent->turn_channels[i].bound = 1;
+      break;
+    }
+  }
+  if (!agent_turn_has_permission(agent, peer) &&
+      agent->turn_permissions_count < AGENT_TURN_MAX_PERMISSIONS) {
+    agent->turn_permissions[agent->turn_permissions_count++] = *peer;
+  }
+  char addr_string[ADDRSTRLEN];
+  addr_to_string(peer, addr_string, sizeof(addr_string));
+  LOGD("TURN ChannelBind assumed OK ch=0x%04x for %s:%d", (unsigned)channel, addr_string, peer->port);
+  return 0;
+}
+
+static int agent_turn_peer_prefers_send(Agent* agent, Address* peer) {
+  int i;
+  for (i = 0; i < agent->turn_channels_count; i++) {
+    if (agent_addr_same(&agent->turn_channels[i].peer, peer)) {
+      return agent->turn_channels[i].use_send;
+    }
+  }
+  return 0;
+}
+
+static void agent_turn_mark_peer_send(Agent* agent, Address* peer) {
+  int i;
+  for (i = 0; i < agent->turn_channels_count; i++) {
+    if (agent_addr_same(&agent->turn_channels[i].peer, peer)) {
+      agent->turn_channels[i].use_send = 1;
+      return;
+    }
+  }
+  if (agent->turn_channels_count >= AGENT_TURN_MAX_CHANNELS) {
+    return;
+  }
+  i = agent->turn_channels_count++;
+  agent->turn_channels[i].peer = *peer;
+  agent->turn_channels[i].number = 0;
+  agent->turn_channels[i].bound = 0;
+  agent->turn_channels[i].use_send = 1;
+}
+
+static int agent_turn_get_or_bind_channel(Agent* agent, Address* peer, uint16_t* out_ch) {
+  int i;
+
+  if (agent_turn_peer_prefers_send(agent, peer)) {
+    return -1;
+  }
+  for (i = 0; i < agent->turn_channels_count; i++) {
+    if (agent_addr_same(&agent->turn_channels[i].peer, peer)) {
+      if (agent->turn_channels[i].use_send) {
+        return -1;
+      }
+      if (!agent->turn_channels[i].bound) {
+        if (agent_turn_channel_bind_req(agent, peer, agent->turn_channels[i].number) != 0) {
+          return -1;
+        }
+        agent->turn_channels[i].bound = 1;
+      }
+      *out_ch = agent->turn_channels[i].number;
+      return 0;
+    }
+  }
+  if (agent->turn_channels_count >= AGENT_TURN_MAX_CHANNELS) {
+    return -1;
+  }
+  i = agent->turn_channels_count++;
+  agent->turn_channels[i].peer = *peer;
+  agent->turn_channels[i].number = agent->turn_next_channel++;
+  if (agent->turn_next_channel > STUN_CHANNEL_NUMBER_MAX) {
+    agent->turn_next_channel = STUN_CHANNEL_NUMBER_MIN;
+  }
+  agent->turn_channels[i].bound = 0;
+  agent->turn_channels[i].use_send = 0;
+  if (agent_turn_channel_bind_req(agent, peer, agent->turn_channels[i].number) != 0) {
+    agent->turn_channels[i].use_send = 1;
+    return -1;
+  }
+  agent->turn_channels[i].bound = 1;
+  *out_ch = agent->turn_channels[i].number;
   return 0;
 }
 
@@ -342,10 +777,37 @@ static int agent_turn_send(Agent* agent, Address* peer, const uint8_t* data, int
   StunMessage send_msg;
   char xor_peer[32];
   int xor_len;
+  int ret;
+  uint16_t channel;
 
   if (!agent->turn_allocated || !peer || !data || len <= 0) {
     return -1;
   }
+
+  /* Prefer ChannelData (coturn does not relay Send Indication on TURN/TCP; UDP loopback same). */
+  if (!agent_turn_peer_prefers_send(agent, peer)) {
+    if (agent_turn_get_or_bind_channel(agent, peer, &channel) == 0) {
+      char ps[ADDRSTRLEN];
+      addr_to_string(peer, ps, sizeof(ps));
+      LOGI("TURN ChannelData %d B -> %s:%d ch=0x%04x", len, ps, peer->port, (unsigned)channel);
+      if (agent->turn_use_tcp) {
+        StunMessage drain_msg;
+        ret = stun_tcp_send_channel_data(&agent->turn_tcp, channel, data, len);
+        memset(&drain_msg, 0, sizeof(drain_msg));
+        for (int d = 0; d < 16; d++) {
+          if (!agent_turn_tcp_poll_recv(agent, &drain_msg)) {
+            break;
+          }
+          memset(&drain_msg, 0, sizeof(drain_msg));
+        }
+        return ret;
+      }
+      ret = agent_turn_udp_send_channel_data(agent, channel, data, len);
+      agent_turn_drain_udp(agent);
+      return ret;
+    }
+  }
+
   if (agent_turn_create_permission(agent, peer) != 0) {
     return -1;
   }
@@ -355,7 +817,11 @@ static int agent_turn_send(Agent* agent, Address* peer, const uint8_t* data, int
   xor_len = agent_turn_write_xor_peer(xor_peer, peer, (StunHeader*)send_msg.buf);
   stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_XOR_PEER_ADDRESS, xor_len, xor_peer);
   stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_DATA, len, (char*)data);
-  return agent_socket_send(agent, &agent->turn_server, send_msg.buf, send_msg.size);
+  ret = agent_turn_control_send(agent, send_msg.buf, send_msg.size);
+  if (!agent->turn_use_tcp) {
+    agent_turn_drain_udp(agent);
+  }
+  return ret;
 }
 
 static int agent_pair_rank(const IceCandidatePair* pair) {
@@ -437,11 +903,18 @@ static void agent_note_inbound_binding(Agent* agent, Address* addr) {
     }
   }
   if (best) {
+    const int same_as_selected =
+        (agent->selected_pair && agent->selected_pair == best &&
+         agent->selected_pair->state == ICE_CANDIDATE_STATE_SUCCEEDED);
     agent->nominated_pair = best;
     agent->selected_pair = best;
-    char raddr[ADDRSTRLEN];
-    addr_to_string(addr, raddr, sizeof(raddr));
-    LOGI("ICE inbound Binding OK — nominated %s:%d", raddr, addr->port);
+    if (!same_as_selected) {
+      char raddr[ADDRSTRLEN];
+      addr_to_string(addr, raddr, sizeof(raddr));
+      LOGI("ICE inbound Binding OK — nominated %s:%d", raddr, addr->port);
+    } else {
+      LOGD("ICE keepalive binding from selected pair");
+    }
   }
 }
 
@@ -482,6 +955,49 @@ static int agent_create_host_addr(Agent* agent) {
   return 0;
 }
 
+static int agent_parse_ice_server_url(const char* urls, char* hostname, size_t hlen, int* port,
+                                      int* use_tcp) {
+  const char* rest;
+  char tmp[256];
+  char* q;
+  char* colon;
+
+  if (!urls || !hostname || !port || !use_tcp) {
+    return -1;
+  }
+  *use_tcp = 0;
+  if (strncmp(urls, "stun:", 5) == 0) {
+    rest = urls + 5;
+  } else if (strncmp(urls, "turn:", 5) == 0) {
+    rest = urls + 5;
+  } else {
+    return -1;
+  }
+  strncpy(tmp, rest, sizeof(tmp) - 1);
+  tmp[sizeof(tmp) - 1] = '\0';
+  q = strchr(tmp, '?');
+  if (q) {
+#if CONFIG_TURN_TCP
+    if (strstr(q, "transport=tcp") != NULL) {
+      *use_tcp = 1;
+    }
+#endif
+    *q = '\0';
+  }
+  colon = strrchr(tmp, ':');
+  if (!colon) {
+    return -1;
+  }
+  *port = atoi(colon + 1);
+  if (*port <= 0) {
+    return -1;
+  }
+  *colon = '\0';
+  strncpy(hostname, tmp, hlen - 1);
+  hostname[hlen - 1] = '\0';
+  return 0;
+}
+
 static int agent_create_stun_addr(Agent* agent, Address* serv_addr) {
   int ret = -1;
   Address bind_addr;
@@ -512,7 +1028,8 @@ static int agent_create_stun_addr(Agent* agent, Address* serv_addr) {
   return ret;
 }
 
-static int agent_create_turn_addr(Agent* agent, Address* serv_addr, const char* username, const char* credential) {
+static int agent_create_turn_addr(Agent* agent, Address* serv_addr, const char* username,
+                                  const char* credential, int use_tcp) {
   int ret = -1;
   uint32_t attr = ntohl(0x11000000);
   Address turn_addr;
@@ -528,111 +1045,151 @@ static int agent_create_turn_addr(Agent* agent, Address* serv_addr, const char* 
   strncpy(agent->turn_username, username, sizeof(agent->turn_username) - 1);
   strncpy(agent->turn_password, credential, sizeof(agent->turn_password) - 1);
 
+#if CONFIG_TURN_TCP
+  agent->turn_use_tcp = 0;
+  if (use_tcp) {
+    agent->turn_tcp.fd = -1;
+    if (tcp_socket_open(&agent->turn_tcp, serv_addr->family) < 0) {
+      LOGE("TURN/TCP socket open failed");
+      return -1;
+    }
+    if (tcp_socket_connect(&agent->turn_tcp, serv_addr) < 0) {
+      tcp_socket_close(&agent->turn_tcp);
+      return -1;
+    }
+    agent->turn_use_tcp = 1;
+    LOGI("TURN control transport: TCP");
+  } else
+#endif
+  {
+    LOGI("TURN control transport: UDP");
+  }
+
   memset(&recv_msg, 0, sizeof(recv_msg));
   memset(&send_msg, 0, sizeof(send_msg));
   stun_msg_create(&send_msg, STUN_METHOD_ALLOCATE);
-  stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_REQUESTED_TRANSPORT, sizeof(attr), (char*)&attr);  // UDP
+  stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_REQUESTED_TRANSPORT, sizeof(attr), (char*)&attr);
   stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_USERNAME, strlen(username), (char*)username);
 
-  ret = agent_socket_send(agent, serv_addr, send_msg.buf, send_msg.size);
+  ret = agent_turn_control_send(agent, send_msg.buf, send_msg.size);
   if (ret == -1) {
-    LOGE("Failed to send TURN Binding Request.");
-    return -1;
+    LOGE("Failed to send TURN Allocate.");
+    goto fail;
   }
 
-  ret = agent_socket_recv_attempts(agent, NULL, recv_msg.buf, sizeof(recv_msg.buf), AGENT_STUN_RECV_MAXTIMES);
+  ret = agent_turn_control_recv_attempts(agent, &recv_msg, AGENT_STUN_RECV_MAXTIMES);
   if (ret <= 0) {
-    LOGD("Failed to receive STUN Binding Response.");
-    return ret;
+    LOGE("Failed to receive TURN Allocate response (ret=%d).", ret);
+    goto fail;
   }
 
   stun_parse_msg_buf(&recv_msg);
+  LOGD("TURN Allocate challenge class=0x%x method=0x%x", recv_msg.stunclass, recv_msg.stunmethod);
 
   if (recv_msg.stunclass == STUN_CLASS_ERROR && recv_msg.stunmethod == STUN_METHOD_ALLOCATE) {
+    if (recv_msg.realm[0]) {
+      strncpy(agent->turn_realm, recv_msg.realm, sizeof(agent->turn_realm) - 1);
+      agent->turn_realm[sizeof(agent->turn_realm) - 1] = '\0';
+    }
+    if (recv_msg.nonce[0]) {
+      strncpy(agent->turn_nonce, recv_msg.nonce, sizeof(agent->turn_nonce) - 1);
+      agent->turn_nonce[sizeof(agent->turn_nonce) - 1] = '\0';
+    }
     memset(&send_msg, 0, sizeof(send_msg));
     stun_msg_create(&send_msg, STUN_METHOD_ALLOCATE);
-    stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_REQUESTED_TRANSPORT, sizeof(attr), (char*)&attr);  // UDP
+    stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_REQUESTED_TRANSPORT, sizeof(attr), (char*)&attr);
     stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_USERNAME, strlen(username), (char*)username);
     stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_NONCE, strlen(recv_msg.nonce), recv_msg.nonce);
     stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_REALM, strlen(recv_msg.realm), recv_msg.realm);
     stun_msg_finish(&send_msg, STUN_CREDENTIAL_LONG_TERM, credential, strlen(credential));
+  } else if (recv_msg.stunclass == STUN_CLASS_ERROR) {
+    LOGE("TURN Allocate unexpected error class=0x%x method=0x%x", recv_msg.stunclass, recv_msg.stunmethod);
+    goto fail;
   } else {
-    LOGE("Invalid TURN Binding Response.");
-    return -1;
+    LOGE("Invalid TURN Allocate challenge class=0x%x method=0x%x size=%d", recv_msg.stunclass,
+         recv_msg.stunmethod, recv_msg.size);
+    goto fail;
   }
 
-  ret = agent_socket_send(agent, serv_addr, send_msg.buf, send_msg.size);
+  ret = agent_turn_control_send(agent, send_msg.buf, send_msg.size);
   if (ret < 0) {
-    LOGE("Failed to send TURN Binding Request.");
-    return -1;
+    LOGE("Failed to send authenticated TURN Allocate.");
+    goto fail;
   }
 
-  ret = agent_socket_recv_attempts(agent, NULL, recv_msg.buf, sizeof(recv_msg.buf), AGENT_STUN_RECV_MAXTIMES);
+  memset(&recv_msg, 0, sizeof(recv_msg));
+  ret = agent_turn_control_recv_attempts(agent, &recv_msg, AGENT_STUN_RECV_MAXTIMES);
   if (ret <= 0) {
     LOGD("Failed to receive TURN Allocate success.");
-    return ret;
+    goto fail;
   }
 
   stun_parse_msg_buf(&recv_msg);
   if (recv_msg.stunclass != STUN_CLASS_RESPONSE) {
-    LOGE("TURN Allocate failed");
-    return -1;
+    LOGE("TURN Allocate failed class=0x%x", recv_msg.stunclass);
+    goto fail;
   }
   memcpy(&turn_addr, &recv_msg.relayed_addr, sizeof(Address));
-  strncpy(agent->turn_realm, recv_msg.realm, sizeof(agent->turn_realm) - 1);
-  strncpy(agent->turn_nonce, recv_msg.nonce, sizeof(agent->turn_nonce) - 1);
+  if (recv_msg.realm[0]) {
+    strncpy(agent->turn_realm, recv_msg.realm, sizeof(agent->turn_realm) - 1);
+  }
+  if (recv_msg.nonce[0]) {
+    strncpy(agent->turn_nonce, recv_msg.nonce, sizeof(agent->turn_nonce) - 1);
+  }
   agent->turn_allocated = 1;
   agent->turn_permissions_count = 0;
+  agent->turn_channels_count = 0;
+  agent->turn_next_channel = STUN_CHANNEL_NUMBER_MIN;
   memcpy(&agent->turn_relay_addr, &turn_addr, sizeof(Address));
   addr_to_string(&turn_addr, addr_string, sizeof(addr_string));
-  LOGI("TURN relay allocated %s:%d", addr_string, turn_addr.port);
+  LOGI("TURN relay allocated %s:%d (control=%s)", addr_string, turn_addr.port,
+       agent->turn_use_tcp ? "tcp" : "udp");
 
   IceCandidate* ice_candidate = agent->local_candidates + agent->local_candidates_count++;
   ice_candidate_create(ice_candidate, agent->local_candidates_count, ICE_CANDIDATE_TYPE_RELAY, &turn_addr);
   return 0;
+
+fail:
+#if CONFIG_TURN_TCP
+  if (agent->turn_use_tcp) {
+    tcp_socket_close(&agent->turn_tcp);
+    agent->turn_use_tcp = 0;
+  }
+#endif
+  return -1;
 }
 
 void agent_gather_candidate(Agent* agent, const char* urls, const char* username, const char* credential) {
-  char* pos;
   int port;
+  int use_tcp = 0;
   char hostname[64];
   char addr_string[ADDRSTRLEN];
   int i;
-  int addr_type[1] = {AF_INET};  // ipv6 no need stun
+  int addr_type[1] = {AF_INET};
   Address resolved_addr;
-  memset(hostname, 0, sizeof(hostname));
 
   if (urls == NULL) {
     agent_create_host_addr(agent);
     return;
   }
 
-  if ((pos = strstr(urls + 5, ":")) == NULL) {
-    LOGE("Invalid URL");
+  if (agent_parse_ice_server_url(urls, hostname, sizeof(hostname), &port, &use_tcp) != 0) {
+    LOGE("Invalid ICE server URL: %s", urls);
     return;
   }
 
-  port = atoi(pos + 1);
-  if (port <= 0) {
-    LOGE("Cannot parse port");
-    return;
-  }
+  for (i = 0; i < (int)(sizeof(addr_type) / sizeof(addr_type[0])); i++) {
+    if (ports_resolve_addr(hostname, &resolved_addr) != 0) {
+      continue;
+    }
+    addr_set_port(&resolved_addr, port);
+    addr_to_string(&resolved_addr, addr_string, sizeof(addr_string));
+    LOGI("Resolved ICE server %s:%d tcp=%d", addr_string, port, use_tcp);
 
-  snprintf(hostname, pos - urls - 5 + 1, "%s", urls + 5);
-
-  for (i = 0; i < sizeof(addr_type) / sizeof(addr_type[0]); i++) {
-    if (ports_resolve_addr(hostname, &resolved_addr) == 0) {
-      addr_set_port(&resolved_addr, port);
-      addr_to_string(&resolved_addr, addr_string, sizeof(addr_string));
-      LOGI("Resolved stun/turn server %s:%d", addr_string, port);
-
-      if (strncmp(urls, "stun:", 5) == 0) {
-        LOGD("Create stun addr");
-        agent_create_stun_addr(agent, &resolved_addr);
-      } else if (strncmp(urls, "turn:", 5) == 0) {
-        LOGD("Create turn addr");
-        agent_create_turn_addr(agent, &resolved_addr, username, credential);
-      }
+    if (strncmp(urls, "stun:", 5) == 0) {
+      agent_create_stun_addr(agent, &resolved_addr);
+    } else if (strncmp(urls, "turn:", 5) == 0) {
+      agent_create_turn_addr(agent, &resolved_addr, username, credential, use_tcp);
     }
   }
 }
@@ -733,26 +1290,41 @@ void agent_process_stun_request(Agent* agent, StunMessage* stun_msg, Address* ad
       const char* req_pwd = agent_stun_password_for_msg(agent, stun_msg);
       if (stun_msg_is_valid(stun_msg->buf, stun_msg->size, (char*)req_pwd) == 0) {
         char req_from[ADDRSTRLEN];
+        const int settled = agent_inbound_from_selected_pair(agent, addr);
         addr_to_string(addr, req_from, sizeof(req_from));
-        LOGI("ICE STUN Binding request from %s:%d", req_from, addr->port);
+        if (!settled) {
+          LOGI("ICE STUN Binding request from %s:%d", req_from, addr->port);
+        } else {
+          LOGD("ICE STUN Binding keepalive from %s:%d", req_from, addr->port);
+        }
         header = (StunHeader*)stun_msg->buf;
         memcpy(agent->transaction_id, header->transaction_id, sizeof(header->transaction_id));
-        agent_note_inbound_binding(agent, addr);
+        if (!settled) {
+          agent_note_inbound_binding(agent, addr);
+        }
         pair = agent_find_pair_for_addr(agent, addr);
         if (stun_msg->use_candidate && pair) {
           pair->state = ICE_CANDIDATE_STATE_SUCCEEDED;
           agent->nominated_pair = pair;
           agent->selected_pair = pair;
-          LOGI("ICE nominated by remote USE-CANDIDATE");
+          if (!settled) {
+            LOGI("ICE nominated by remote USE-CANDIDATE");
+          }
         }
         agent_create_binding_response(agent, &msg, addr);
-        if (pair && agent_pair_needs_turn(pair) && agent->turn_allocated) {
+        if (agent->turn_allocated) {
           agent_turn_send(agent, addr, msg.buf, msg.size);
         } else {
           agent_socket_send(agent, addr, msg.buf, msg.size);
         }
-        LOGI("ICE STUN Binding response sent to %s:%d (%u B)", req_from, addr->port, (unsigned)msg.size);
+        if (!settled) {
+          LOGI("ICE STUN Binding response sent to %s:%d (%u B)", req_from, addr->port, (unsigned)msg.size);
+        }
         agent->binding_request_time = ports_get_epoch_time();
+      } else {
+        char req_from[ADDRSTRLEN];
+        addr_to_string(addr, req_from, sizeof(req_from));
+        LOGW("ICE Binding request auth failed from %s:%d", req_from, addr->port);
       }
       break;
     default:
@@ -761,6 +1333,7 @@ void agent_process_stun_request(Agent* agent, StunMessage* stun_msg, Address* ad
 }
 
 void agent_process_stun_response(Agent* agent, StunMessage* stun_msg) {
+  agent_turn_cb_try_finish_from_response(agent, stun_msg);
   agent_turn_cp_try_finish_from_response(agent, stun_msg);
   switch (stun_msg->stunmethod) {
     case STUN_METHOD_BINDING:
@@ -795,14 +1368,22 @@ static void agent_process_inbound_stun(Agent* agent, StunMessage* stun_msg, Addr
       agent_process_stun_response(agent, stun_msg);
       break;
     case STUN_CLASS_INDICATION:
-      if (stun_msg->stunmethod == STUN_METHOD_SEND && stun_msg->data_len > 0 &&
-          stun_probe(stun_msg->data, (size_t)stun_msg->data_len) == 0) {
-        StunMessage inner;
-        memset(&inner, 0, sizeof(inner));
-        memcpy(inner.buf, stun_msg->data, (size_t)stun_msg->data_len);
-        inner.size = (size_t)stun_msg->data_len;
-        stun_parse_msg_buf(&inner);
-        agent_process_inbound_stun(agent, &inner, &stun_msg->peer_addr);
+      if ((stun_msg->stunmethod == STUN_METHOD_SEND || stun_msg->stunmethod == STUN_METHOD_DATA) &&
+          stun_msg->data_len > 0) {
+        char peer_str[ADDRSTRLEN];
+        addr_to_string(&stun_msg->peer_addr, peer_str, sizeof(peer_str));
+        LOGI("TURN %s indication %d B from peer %s:%d", stun_msg->stunmethod == STUN_METHOD_DATA ? "Data" : "Send",
+             stun_msg->data_len, peer_str, stun_msg->peer_addr.port);
+        if (stun_probe(stun_msg->data, (size_t)stun_msg->data_len) == 0) {
+          StunMessage inner;
+          memset(&inner, 0, sizeof(inner));
+          memcpy(inner.buf, stun_msg->data, (size_t)stun_msg->data_len);
+          inner.size = (size_t)stun_msg->data_len;
+          stun_parse_msg_buf(&inner);
+          agent_process_inbound_stun(agent, &inner, &stun_msg->peer_addr);
+        } else {
+          LOGW("TURN indication payload is not STUN (%d bytes)", stun_msg->data_len);
+        }
       }
       break;
     default:
@@ -810,16 +1391,91 @@ static void agent_process_inbound_stun(Agent* agent, StunMessage* stun_msg, Addr
   }
 }
 
+static int agent_turn_tcp_poll_recv(Agent* agent, StunMessage* stun_msg) {
+  fd_set rfds;
+  struct timeval tv;
+  int ret;
+  int is_channel = 0;
+  uint16_t channel = 0;
+  int got = 0;
+
+  if (!agent->turn_use_tcp || agent->turn_tcp.fd < 0) {
+    return 0;
+  }
+  for (;;) {
+    FD_ZERO(&rfds);
+    FD_SET(agent->turn_tcp.fd, &rfds);
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+    if (select(agent->turn_tcp.fd + 1, &rfds, NULL, NULL, &tv) <= 0) {
+      break;
+    }
+    ret = stun_tcp_recv_turn_frame(&agent->turn_tcp, stun_msg->buf, (int)sizeof(stun_msg->buf),
+                                   &is_channel, &channel);
+    if (ret <= 0) {
+      break;
+    }
+    got = 1;
+    if (is_channel) {
+      int plen = (int)(((uint16_t)stun_msg->buf[2] << 8) | stun_msg->buf[3]);
+      agent_turn_process_channel_payload(agent, channel, stun_msg->buf + 4, plen);
+      continue;
+    }
+    stun_msg->size = (size_t)ret;
+    stun_parse_msg_buf(stun_msg);
+    agent_turn_dispatch_stun_msg(agent, stun_msg, &stun_msg->peer_addr);
+  }
+  return got;
+}
+
+static void agent_turn_tcp_drain_media(Agent* agent, int wait_ms) {
+  StunMessage stun_msg;
+  int elapsed = 0;
+
+  if (!agent->turn_use_tcp || agent->turn_tcp.fd < 0 || wait_ms <= 0) {
+    return;
+  }
+  memset(&stun_msg, 0, sizeof(stun_msg));
+  while (elapsed < wait_ms) {
+    if (agent->nominated_pair && agent->nominated_pair->state == ICE_CANDIDATE_STATE_SUCCEEDED) {
+      break;
+    }
+    if (agent_turn_tcp_poll_recv(agent, &stun_msg)) {
+      memset(&stun_msg, 0, sizeof(stun_msg));
+      continue;
+    }
+    ports_sleep_ms(10);
+    elapsed += 10;
+  }
+}
+
 int agent_recv(Agent* agent, uint8_t* buf, int len) {
   int ret = -1;
   StunMessage stun_msg;
   Address addr;
-  if ((ret = agent_socket_recv(agent, &addr, buf, len)) > 0 && stun_probe(buf, len) == 0) {
+
+  memset(&stun_msg, 0, sizeof(stun_msg));
+  while (agent_turn_tcp_poll_recv(agent, &stun_msg)) {
     memset(&stun_msg, 0, sizeof(stun_msg));
-    memcpy(stun_msg.buf, buf, ret);
-    stun_msg.size = ret;
-    stun_parse_msg_buf(&stun_msg);
-    agent_process_inbound_stun(agent, &stun_msg, &addr);
+  }
+  if (agent->nominated_pair && agent->nominated_pair->state == ICE_CANDIDATE_STATE_SUCCEEDED) {
+    return 0;
+  }
+  if ((ret = agent_socket_recv(agent, &addr, buf, len)) > 0) {
+    if (agent_turn_process_udp_datagram(agent, &addr, buf, ret)) {
+      return 0;
+    }
+    if (stun_probe(buf, (size_t)len) == 0) {
+      memset(&stun_msg, 0, sizeof(stun_msg));
+      memcpy(stun_msg.buf, buf, (size_t)ret);
+      stun_msg.size = (size_t)ret;
+      stun_parse_msg_buf(&stun_msg);
+      if (agent->turn_allocated && agent_addr_is_turn_server(agent, &addr)) {
+        agent_turn_dispatch_stun_msg(agent, &stun_msg, &addr);
+      } else {
+        agent_process_inbound_stun(agent, &stun_msg, &addr);
+      }
+    }
     ret = 0;
   }
   return ret;
@@ -966,6 +1622,62 @@ void agent_add_pairs_for_remote(Agent* agent, int remote_idx) {
   LOGD("trickle pair add remote[%d]: pairs=%d", remote_idx, agent->candidate_pairs_num);
 }
 
+void agent_pump(Agent* agent, int rounds) {
+  uint8_t buf[1400];
+  int i;
+
+  if (!agent || rounds <= 0) {
+    return;
+  }
+  for (i = 0; i < rounds; i++) {
+    memset(buf, 0, sizeof(buf));
+    agent_recv(agent, buf, (int)sizeof(buf));
+    agent_turn_drain_udp(agent);
+    if (agent->nominated_pair && agent->nominated_pair->state == ICE_CANDIDATE_STATE_SUCCEEDED) {
+      agent->selected_pair = agent->nominated_pair;
+    }
+  }
+}
+
+void agent_log_ice_progress(const Agent* agent, const char* tag) {
+  char la[ADDRSTRLEN];
+  char ra[ADDRSTRLEN];
+  const IceCandidatePair* p;
+  int ch = 0;
+
+  if (!agent) {
+    return;
+  }
+  p = agent->nominated_pair;
+  if (!p || !p->local || !p->remote) {
+    LOGI("ICE progress (%s): no nominated pair (pairs=%d turn=%d)", tag ? tag : "?", agent->candidate_pairs_num,
+         agent->turn_allocated);
+    return;
+  }
+  addr_to_string(&p->local->addr, la, sizeof(la));
+  addr_to_string(&p->remote->addr, ra, sizeof(ra));
+  for (int i = 0; i < agent->turn_channels_count; i++) {
+    if (agent->turn_channels[i].bound) {
+      ch++;
+    }
+  }
+  LOGI(
+      "ICE progress (%s): pair_state=%d conncheck=%d/%d local=%s:%d remote=%s:%d turn=%d ch_bound=%d/%d "
+      "mode=%s",
+      tag ? tag : "?",
+      (int)p->state,
+      p->conncheck,
+      AGENT_CONNCHECK_MAX,
+      la,
+      p->local->addr.port,
+      ra,
+      p->remote->addr.port,
+      agent->turn_allocated,
+      ch,
+      agent->turn_channels_count,
+      agent->mode == AGENT_MODE_CONTROLLING ? "ctrl" : "controlled");
+}
+
 int agent_connectivity_check(Agent* agent) {
   char addr_string[ADDRSTRLEN];
   uint8_t buf[1400];
@@ -975,7 +1687,26 @@ int agent_connectivity_check(Agent* agent) {
     return 0;
   }
 
-  if (!agent->nominated_pair || agent->nominated_pair->state != ICE_CANDIDATE_STATE_INPROGRESS) {
+  if (!agent->nominated_pair) {
+    return -1;
+  }
+
+  if (agent->nominated_pair->state == ICE_CANDIDATE_STATE_SUCCEEDED) {
+    agent->selected_pair = agent->nominated_pair;
+    return 0;
+  }
+
+  if (agent->nominated_pair->state == ICE_CANDIDATE_STATE_FAILED) {
+    agent_pump(agent, 24);
+    if (agent->nominated_pair->state == ICE_CANDIDATE_STATE_SUCCEEDED) {
+      agent->selected_pair = agent->nominated_pair;
+      LOGI("ICE pair recovered to SUCCEEDED after FAILED (late binding response)");
+      return 0;
+    }
+    return -1;
+  }
+
+  if (agent->nominated_pair->state != ICE_CANDIDATE_STATE_INPROGRESS) {
     return -1;
   }
 
@@ -993,13 +1724,28 @@ int agent_connectivity_check(Agent* agent) {
     agent_create_binding_request(agent, &msg);
     if (agent_pair_needs_turn(agent->nominated_pair) && agent->turn_allocated) {
       agent_turn_send(agent, &agent->nominated_pair->remote->addr, msg.buf, msg.size);
+#if CONFIG_TURN_TCP
+      if (agent->turn_use_tcp) {
+        agent_turn_tcp_drain_media(agent, 120);
+      } else
+#endif
+      {
+        for (int u = 0; u < 20; u++) {
+          agent_turn_drain_udp(agent);
+          if (agent->nominated_pair->state == ICE_CANDIDATE_STATE_SUCCEEDED) {
+            break;
+          }
+          ports_sleep_ms(5);
+        }
+      }
     } else {
       agent_socket_send(agent, &agent->nominated_pair->remote->addr, msg.buf, msg.size);
     }
   }
 
-  for (int drain = 0; drain < 12; drain++) {
+  for (int drain = 0; drain < 16; drain++) {
     agent_recv(agent, buf, sizeof(buf));
+    agent_turn_drain_udp(agent);
     if (agent->nominated_pair->state == ICE_CANDIDATE_STATE_SUCCEEDED) {
       break;
     }
@@ -1008,6 +1754,25 @@ int agent_connectivity_check(Agent* agent) {
   if (agent->nominated_pair->state == ICE_CANDIDATE_STATE_SUCCEEDED) {
     agent->selected_pair = agent->nominated_pair;
     return 0;
+  }
+
+  agent->nominated_pair->conncheck++;
+  if (agent->nominated_pair->conncheck >= AGENT_CONNCHECK_MAX) {
+    LOGW("ICE pair conncheck budget exhausted (%d)", agent->nominated_pair->conncheck);
+    if (agent->turn_allocated) {
+#if CONFIG_TURN_TCP
+      if (agent->turn_use_tcp) {
+        agent_turn_tcp_drain_media(agent, 150);
+      }
+#endif
+      agent_pump(agent, 16);
+    }
+    if (agent->nominated_pair->state == ICE_CANDIDATE_STATE_SUCCEEDED) {
+      agent->selected_pair = agent->nominated_pair;
+      LOGI("ICE pair succeeded on final drain before FAILED");
+      return 0;
+    }
+    agent->nominated_pair->state = ICE_CANDIDATE_STATE_FAILED;
   }
 
   return -1;
@@ -1053,13 +1818,10 @@ int agent_select_candidate_pair(Agent* agent) {
     return 0;
   }
   for (i = 0; i < agent->candidate_pairs_num; i++) {
-    if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_INPROGRESS) {
+    if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_INPROGRESS ||
+        agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_FAILED) {
       agent->nominated_pair = &agent->candidate_pairs[i];
-      agent->candidate_pairs[i].conncheck++;
-      if (agent->candidate_pairs[i].conncheck < AGENT_CONNCHECK_MAX) {
-        return 0;
-      }
-      agent->candidate_pairs[i].state = ICE_CANDIDATE_STATE_FAILED;
+      return 0;
     }
   }
   return -1;

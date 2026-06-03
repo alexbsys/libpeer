@@ -11,6 +11,14 @@
 #define CONFIG_USE_LWIP 0
 #endif
 
+#ifndef CONFIG_ICE_RELAY_ONLY
+#define CONFIG_ICE_RELAY_ONLY 0
+#endif
+
+#ifndef CONFIG_TURN_TCP
+#define CONFIG_TURN_TCP 1
+#endif
+
 #ifndef CONFIG_MBEDTLS_DEBUG
 #define CONFIG_MBEDTLS_DEBUG 0
 #endif
@@ -50,7 +58,10 @@
 #endif
 
 #ifndef CONFIG_KEEPALIVE_TIMEOUT
-#define CONFIG_KEEPALIVE_TIMEOUT 10000
+/* No inbound STUN Binding for this long → peer considered gone (ms).
+ * Browser consent freshness is typically 250 ms–5 s; 30 s avoids false
+ * drops on brief stalls without changing how often we must respond. */
+#define CONFIG_KEEPALIVE_TIMEOUT 30000
 #endif
 
 #ifndef CONFIG_AUDIO_DURATION

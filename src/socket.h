@@ -35,4 +35,9 @@ int tcp_socket_send(TcpSocket* tcp_socket, const uint8_t* buf, int len);
 
 int tcp_socket_recv(TcpSocket* tcp_socket, uint8_t* buf, int len);
 
+/** Block until len bytes received or error (for STUN/TCP framing). */
+int tcp_socket_recv_exact(TcpSocket* tcp_socket, uint8_t* buf, int len);
+
+void tcp_socket_set_recv_timeout_ms(TcpSocket* tcp_socket, int ms);
+
 #endif  // SOCKET_H_

@@ -764,7 +764,9 @@ static const char* peer_connection_create_sdp(PeerConnection* pc, SdpType sdp_ty
 
   pc->b_local_description_created = 1;
 
-  agent_gather_candidate(&pc->agent, NULL, NULL, NULL);  // host address
+#if !CONFIG_ICE_RELAY_ONLY
+  agent_gather_candidate(&pc->agent, NULL, NULL, NULL);
+#endif
 
   if (sdp_type == SDP_TYPE_ANSWER) {
     /* Emit the answer immediately with host candidates only; STUN/TURN round-trips

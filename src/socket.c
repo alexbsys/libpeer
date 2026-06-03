@@ -1,5 +1,8 @@
 #include <errno.h>
+#include <fcntl.h>
+#include <netinet/tcp.h>
 #include <string.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include "socket.h"
@@ -27,6 +30,17 @@ int udp_socket_add_multicast_group(UdpSocket* udp_socket, Address* mcast_addr) {
   return 0;
 }
 
+static int socket_avoid_stdio_fd(int fd) {
+  if (fd <= 2) {
+    int dupfd = fcntl(fd, F_DUPFD, 3);
+    if (dupfd >= 0) {
+      close(fd);
+      return dupfd;
+    }
+  }
+  return fd;
+}
+
 int udp_socket_open(UdpSocket* udp_socket, int family, int port) {
   int ret;
   int reuse = 1;
@@ -37,6 +51,7 @@ int udp_socket_open(UdpSocket* udp_socket, int family, int port) {
   switch (family) {
     case AF_INET6:
       udp_socket->fd = socket(AF_INET6, SOCK_DGRAM, 0);
+      udp_socket->fd = socket_avoid_stdio_fd(udp_socket->fd);
       udp_socket->bind_addr.sin6.sin6_family = AF_INET6;
       udp_socket->bind_addr.sin6.sin6_port = htons(port);
       udp_socket->bind_addr.sin6.sin6_addr = in6addr_any;
@@ -47,6 +62,7 @@ int udp_socket_open(UdpSocket* udp_socket, int family, int port) {
     case AF_INET:
     default:
       udp_socket->fd = socket(AF_INET, SOCK_DGRAM, 0);
+      udp_socket->fd = socket_avoid_stdio_fd(udp_socket->fd);
       udp_socket->bind_addr.sin.sin_family = AF_INET;
       udp_socket->bind_addr.sin.sin_port = htons(port);
       udp_socket->bind_addr.sin.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -234,30 +250,72 @@ int tcp_socket_connect(TcpSocket* tcp_socket, Address* addr) {
     return -1;
   }
 
+  {
+    int one = 1;
+    setsockopt(tcp_socket->fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    tcp_socket_set_recv_timeout_ms(tcp_socket, 50);
+  }
+
   LOGI("Server is connected");
   return 0;
 }
 
+void tcp_socket_set_recv_timeout_ms(TcpSocket* tcp_socket, int ms) {
+  struct timeval tv;
+  if (!tcp_socket || tcp_socket->fd < 0) {
+    return;
+  }
+  if (ms < 0) {
+    ms = 0;
+  }
+  tv.tv_sec = ms / 1000;
+  tv.tv_usec = (ms % 1000) * 1000;
+  setsockopt(tcp_socket->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  setsockopt(tcp_socket->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
 void tcp_socket_close(TcpSocket* tcp_socket) {
-  if (tcp_socket->fd > 0) {
+  if (tcp_socket->fd >= 0) {
     close(tcp_socket->fd);
+    tcp_socket->fd = -1;
   }
 }
 
+int tcp_socket_recv_exact(TcpSocket* tcp_socket, uint8_t* buf, int len) {
+  int got = 0;
+  if (!tcp_socket || tcp_socket->fd < 0 || !buf || len <= 0) {
+    return -1;
+  }
+  while (got < len) {
+    int r = recv(tcp_socket->fd, buf + got, (size_t)(len - got), 0);
+    if (r < 0) {
+      return -1;
+    }
+    if (r == 0) {
+      return -1;
+    }
+    got += r;
+  }
+  return got;
+}
+
 int tcp_socket_send(TcpSocket* tcp_socket, const uint8_t* buf, int len) {
-  int ret;
+  int sent = 0;
 
   if (tcp_socket->fd < 0) {
     LOGE("sendto before socket init");
     return -1;
   }
 
-  ret = send(tcp_socket->fd, buf, len, 0);
-  if (ret < 0) {
-    LOGE("Failed to send: %s", strerror(errno));
-    return -1;
+  while (sent < len) {
+    int ret = send(tcp_socket->fd, buf + sent, (size_t)(len - sent), MSG_NOSIGNAL);
+    if (ret < 0) {
+      LOGE("Failed to send: %s", strerror(errno));
+      return -1;
+    }
+    sent += ret;
   }
-  return ret;
+  return sent;
 }
 
 int tcp_socket_recv(TcpSocket* tcp_socket, uint8_t* buf, int len) {

@@ -74,6 +74,8 @@ struct Agent {
   uint32_t transaction_id[3];
 
   /* TURN allocation state — ICE checks to relay addrs need Send/Permission. */
+  int turn_use_tcp;
+  TcpSocket turn_tcp;
   Address turn_server;
   char turn_username[128];
   char turn_password[128];
@@ -84,10 +86,27 @@ struct Agent {
   Address turn_permissions[16];
   int turn_permissions_count;
 
+  /* TURN/TCP uses ChannelBind + ChannelData (coturn does not relay Send over TCP). */
+#define AGENT_TURN_MAX_CHANNELS 16
+  struct {
+    Address peer;
+    uint16_t number;
+    int bound;
+    int use_send;
+  } turn_channels[AGENT_TURN_MAX_CHANNELS];
+  int turn_channels_count;
+  uint16_t turn_next_channel;
+
   /* CreatePermission reply can arrive while we wait, or be read first by agent_recv (same UDP). */
   uint8_t turn_cp_tid[12];
   Address turn_cp_peer;
   int turn_cp_pending;
+
+  /* ChannelBind reply may be read by agent_recv while ICE loop drains TURN/TCP. */
+  uint8_t turn_cb_tid[12];
+  uint16_t turn_cb_channel;
+  int turn_cb_pending;
+  int turn_cb_ok;
 };
 
 void agent_gather_candidate(Agent* agent, const char* urls, const char* username, const char* credential);
@@ -123,5 +142,11 @@ void agent_add_pairs_for_remote(Agent* agent, int remote_idx);
 
 /** Verbose ICE snapshot for UART debugging (locals/remotes/pairs, pair states). */
 void agent_log_ice_diagnostics(const Agent* agent, const char* reason);
+
+/** Drain TURN/TCP and UDP without sending connectivity checks (late responses, tests). */
+void agent_pump(Agent* agent, int rounds);
+
+/** One-line progress for relay ICE tests (pair state, conncheck, TURN channels). */
+void agent_log_ice_progress(const Agent* agent, const char* tag);
 
 #endif  // AGENT_H_

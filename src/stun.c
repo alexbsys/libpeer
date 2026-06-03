@@ -1,9 +1,11 @@
 #include <inttypes.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
+#include "ports.h"
 #include "stun.h"
 #include "utils.h"
 
@@ -48,12 +50,18 @@ uint32_t CRC32_TABLE[256] = {
 
 void stun_msg_create(StunMessage* msg, uint16_t type) {
   StunHeader* header = (StunHeader*)msg->buf;
+  static uint32_t stun_tid_seq;
+  uint32_t tid[3];
+  uint32_t t = ports_get_epoch_time();
+
   header->type = htons(type);
   header->length = 0;
   header->magic_cookie = htonl(MAGIC_COOKIE);
-  header->transaction_id[0] = htonl(CRC32_TABLE[1]);
-  header->transaction_id[1] = htonl(CRC32_TABLE[2]);
-  header->transaction_id[2] = htonl(CRC32_TABLE[3]);
+  stun_tid_seq++;
+  tid[0] = htonl(t ^ stun_tid_seq);
+  tid[1] = htonl((stun_tid_seq * 0x9e3779b1u) ^ (uintptr_t)msg);
+  tid[2] = htonl((t << 16) ^ (stun_tid_seq << 1));
+  memcpy(header->transaction_id, tid, sizeof(tid));
   msg->size = sizeof(StunHeader);
 }
 
@@ -61,11 +69,16 @@ int stun_set_mapped_address(char* value, uint8_t* mask, Address* addr) {
   int ret, i;
   char addr_string[ADDRSTRLEN];
   uint8_t* family = (uint8_t*)(value + 1);
-  uint16_t* port = (uint16_t*)(value + 2);
-  uint32_t* val32 = (uint32_t*)(value + 4);
   uint16_t* val16 = (uint16_t*)(value + 4);
-  uint32_t* addr32 = (uint32_t*)(&addr->sin.sin_addr);
+  const uint8_t* addr_bytes = (const uint8_t*)&addr->sin.sin_addr.s_addr;
+  uint8_t* out_bytes = (uint8_t*)(value + 4);
   uint16_t* addr16 = (uint16_t*)(&addr->sin6.sin6_addr);
+  /* RFC 5389: port XOR uses the most significant 16 bits of the magic cookie (0x2112). */
+  const uint8_t port_xor_hi = (uint8_t)(MAGIC_COOKIE >> 24);
+  const uint8_t port_xor_lo = (uint8_t)(MAGIC_COOKIE >> 16);
+
+  memset(value, 0, 20);
+  value[0] = 0;
 
   switch (addr->family) {
     case AF_INET6:
@@ -73,29 +86,34 @@ int stun_set_mapped_address(char* value, uint8_t* mask, Address* addr) {
       for (i = 0; i < 8; i++) {
         val16[i] = addr16[i] ^ *(uint16_t*)(mask + 2 * i);
       }
+      value[2] = (uint8_t)(addr->port >> 8) ^ port_xor_hi;
+      value[3] = (uint8_t)(addr->port & 0xff) ^ port_xor_lo;
       ret = 20;
       break;
     case AF_INET:
     default:
       *family = STUN_FAMILY_IPV4;
-      *val32 = *addr32 ^ *(uint32_t*)mask;
+      for (i = 0; i < 4; i++) {
+        out_bytes[i] = addr_bytes[i] ^ mask[i];
+      }
+      value[2] = (uint8_t)(addr->port >> 8) ^ port_xor_hi;
+      value[3] = (uint8_t)(addr->port & 0xff) ^ port_xor_lo;
       ret = 8;
       break;
   }
-
-  *port = htons(addr->port) ^ *(uint16_t*)mask;
   addr_to_string(addr, addr_string, sizeof(addr_string));
 
   LOGD("XOR Mapped Address Family: %d", *family);
-  LOGD("XOR Mapped Address Port: %d (Port XOR: %04x)", addr->port, *port);
-  LOGD("XOR Mapped Address IP: %s (IP XOR: %08" PRIu32 ")", addr_string, *addr32);
+  LOGD("XOR Mapped Address Port: %d", addr->port);
+  LOGD("XOR Mapped Address IP: %s", addr_string);
   return ret;
 }
 
 void stun_get_mapped_address(char* value, uint8_t* mask, Address* addr) {
   int i;
   char addr_string[ADDRSTRLEN];
-  uint32_t* addr32 = (uint32_t*)&addr->sin.sin_addr;
+  uint8_t* addr_bytes = (uint8_t*)&addr->sin.sin_addr.s_addr;
+  const uint8_t* xor_bytes = (const uint8_t*)(value + 4);
   uint16_t* addr16 = (uint16_t*)&addr->sin6.sin6_addr;
   uint8_t family = value[1];
   uint16_t port;
@@ -110,17 +128,23 @@ void stun_get_mapped_address(char* value, uint8_t* mask, Address* addr) {
     case STUN_FAMILY_IPV4:
     default:
       addr_set_family(addr, AF_INET);
-      *addr32 = (*(uint32_t*)(value + 4) ^ *(uint32_t*)mask);
+      for (i = 0; i < 4; i++) {
+        addr_bytes[i] = xor_bytes[i] ^ mask[i];
+      }
       break;
   }
 
-  port = ntohs(*(uint16_t*)(value + 2) ^ *(uint16_t*)mask);
+  {
+    const uint8_t port_xor_hi = (uint8_t)(MAGIC_COOKIE >> 24);
+    const uint8_t port_xor_lo = (uint8_t)(MAGIC_COOKIE >> 16);
+    port = (uint16_t)((((uint16_t)(value[2] ^ port_xor_hi)) << 8) | (value[3] ^ port_xor_lo));
+  }
   addr_to_string(addr, addr_string, sizeof(addr_string));
   addr_set_port(addr, port);
 
   LOGD("XOR Mapped Address Family: %d", family);
   LOGD("XOR Mapped Address Port: %d (Port XOR: %04x)", addr->port, port);
-  LOGD("XOR Mapped Address IP: %s (IP XOR: %08" PRIu32 ")", addr_string, *addr32);
+  LOGD("XOR Mapped Address IP: %s", addr_string);
 }
 
 void stun_parse_msg_buf(StunMessage* msg) {
@@ -145,15 +169,11 @@ void stun_parse_msg_buf(StunMessage* msg) {
 
   msg->has_fingerprint = 0;
 
-  msg->stunmethod = ntohs(header->type) & 0x0FFF;
-  if ((msg->stunmethod & STUN_METHOD_ALLOCATE) == STUN_METHOD_ALLOCATE) {
-    msg->stunmethod = STUN_METHOD_ALLOCATE;
-  } else if ((msg->stunmethod & STUN_METHOD_BINDING) == STUN_METHOD_BINDING) {
-    msg->stunmethod = STUN_METHOD_BINDING;
-  } else if ((msg->stunmethod & STUN_METHOD_SEND) == STUN_METHOD_SEND) {
-    msg->stunmethod = STUN_METHOD_SEND;
-  } else if ((msg->stunmethod & STUN_METHOD_CREATE_PERMISSION) == STUN_METHOD_CREATE_PERMISSION) {
-    msg->stunmethod = STUN_METHOD_CREATE_PERMISSION;
+  /* RFC 5389 §6: 12-bit method (do not use method&MASK — e.g. 0x0109 ChannelBind
+   * response would be misread as Binding because 0x009&0x001==0x001). */
+  {
+    uint16_t stype = ntohs(header->type);
+    msg->stunmethod = (uint16_t)((stype & 0x000F) | ((stype & 0x3E00) >> 2));
   }
 
   while (pos < length) {
@@ -221,6 +241,21 @@ void stun_parse_msg_buf(StunMessage* msg) {
       case STUN_ATTR_TYPE_USE_CANDIDATE:
         msg->use_candidate = 1;
         break;
+      case STUN_ATTR_TYPE_ERROR_CODE: {
+        int alen = ntohs(attr->length);
+        if (alen >= 4) {
+          msg->error_code = (int)((attr->value[2] & 0x07) * 100 + (uint8_t)attr->value[3]);
+        }
+        memset(msg->error_reason, 0, sizeof(msg->error_reason));
+        if (alen > 4) {
+          int rlen = alen - 4;
+          if (rlen >= (int)sizeof(msg->error_reason)) {
+            rlen = (int)sizeof(msg->error_reason) - 1;
+          }
+          memcpy(msg->error_reason, attr->value + 4, (size_t)rlen);
+        }
+        break;
+      }
       case STUN_ATTR_TYPE_FINGERPRINT:
         msg->has_fingerprint = 1;
         memcpy(&msg->fingerprint, attr->value, ntohs(attr->length));
