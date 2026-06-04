@@ -135,9 +135,14 @@ void stun_get_mapped_address(char* value, uint8_t* mask, Address* addr) {
   }
 
   {
+    /* value is char* (signed on most targets). Cast each port byte to uint8_t BEFORE
+     * the XOR, otherwise a byte >= 0x80 sign-extends to 0xFFFFFFxx and corrupts the
+     * high byte of the port (observed: relay ports mis-parsed as 0xFFxx). */
     const uint8_t port_xor_hi = (uint8_t)(MAGIC_COOKIE >> 24);
     const uint8_t port_xor_lo = (uint8_t)(MAGIC_COOKIE >> 16);
-    port = (uint16_t)((((uint16_t)(value[2] ^ port_xor_hi)) << 8) | (value[3] ^ port_xor_lo));
+    const uint8_t p_hi = (uint8_t)((uint8_t)value[2] ^ port_xor_hi);
+    const uint8_t p_lo = (uint8_t)((uint8_t)value[3] ^ port_xor_lo);
+    port = (uint16_t)(((uint16_t)p_hi << 8) | p_lo);
   }
   addr_to_string(addr, addr_string, sizeof(addr_string));
   addr_set_port(addr, port);

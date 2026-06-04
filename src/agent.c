@@ -61,6 +61,7 @@ static const char* agent_stun_password_for_msg(Agent* agent, const StunMessage* 
 }
 
 void agent_clear_candidates(Agent* agent) {
+  agent->consent_ticks = 0;
   if (agent->turn_allocated) {
     agent_turn_deallocate(agent);
     return;
@@ -818,6 +819,19 @@ static int agent_turn_get_or_bind_channel(Agent* agent, Address* peer, uint16_t*
   return 0;
 }
 
+/* ChannelData (4-byte header) is the efficient relay path and is the default. The
+ * earlier "one-way ChannelData" failures were a STUN XOR-address parse bug (now fixed),
+ * not a ChannelData problem. Set AGENT_TURN_USE_INDICATIONS=1 to fall back to the
+ * larger Send/Data indications (debugging / interop). */
+static int agent_turn_channeldata_enabled(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    const char* e = getenv("AGENT_TURN_USE_INDICATIONS");
+    cached = (e && e[0] == '1') ? 0 : 1;
+  }
+  return cached;
+}
+
 static int agent_turn_send(Agent* agent, Address* peer, const uint8_t* data, int len) {
   StunMessage send_msg;
   char xor_peer[32];
@@ -829,11 +843,11 @@ static int agent_turn_send(Agent* agent, Address* peer, const uint8_t* data, int
     return -1;
   }
 
-  /* UDP: ChannelData. TCP: Send/Data indications — coturn relays ICE back as indications, not
-   * ChannelData, on the control connection (loopback tests showed one-way ChannelData). */
-#if CONFIG_TURN_TCP
-  if (!agent->turn_use_tcp)
-#endif
+  /* Use Send/Data indications for both UDP and TCP control. coturn relays ICE back as
+   * indications (not ChannelData) on loopback; ChannelData relay proved unreliable in
+   * pair tests (one direction silently dropped). Indications are slightly larger but
+   * relay reliably in both directions. Set AGENT_TURN_USE_CHANNELDATA=1 to opt back in. */
+  if (agent_turn_channeldata_enabled())
   {
   if (!agent_turn_peer_prefers_send(agent, peer)) {
     if (agent_turn_get_or_bind_channel(agent, peer, &channel) == 0) {
@@ -1518,9 +1532,9 @@ int agent_recv(Agent* agent, uint8_t* buf, int len) {
   while (agent_turn_tcp_poll_recv(agent, &stun_msg)) {
     memset(&stun_msg, 0, sizeof(stun_msg));
   }
-  if (agent->nominated_pair && agent->nominated_pair->state == ICE_CANDIDATE_STATE_SUCCEEDED) {
-    return 0;
-  }
+  /* Note: do NOT early-return when our pair is SUCCEEDED. We must keep reading the
+   * socket to (a) respond to the peer's ongoing connectivity checks so its side can
+   * complete ICE, and (b) deliver media to the caller (peer_connection COMPLETED). */
   if ((ret = agent_socket_recv(agent, &addr, buf, len)) > 0) {
     if (agent_turn_process_udp_datagram(agent, &addr, buf, ret)) {
       return 0;
@@ -1738,12 +1752,36 @@ void agent_log_ice_progress(const Agent* agent, const char* tag) {
       agent->mode == AGENT_MODE_CONTROLLING ? "ctrl" : "controlled");
 }
 
+/* Consent freshness (RFC 7675). After a pair succeeds, keep sending Binding requests
+ * to the peer at a low rate so its own check can still complete — important over a
+ * relay, where the peer may drop our first packets until it installs its permission. */
+#define AGENT_CONSENT_PERIOD 8
+static void agent_connectivity_consent_keepalive(Agent* agent, IceCandidatePair* pair) {
+  StunMessage msg;
+
+  if (!pair || !pair->remote) {
+    return;
+  }
+  if ((agent->consent_ticks++ % AGENT_CONSENT_PERIOD) != 0) {
+    return;
+  }
+  memset(&msg, 0, sizeof(msg));
+  agent->nominated_pair = pair;
+  agent_create_binding_request(agent, &msg);
+  if (agent_pair_needs_turn(pair) && agent->turn_allocated) {
+    agent_turn_send(agent, &pair->remote->addr, msg.buf, msg.size);
+  } else {
+    agent_socket_send(agent, &pair->remote->addr, msg.buf, msg.size);
+  }
+}
+
 int agent_connectivity_check(Agent* agent) {
   char addr_string[ADDRSTRLEN];
   uint8_t buf[1400];
   StunMessage msg;
 
   if (agent->selected_pair && agent->selected_pair->state == ICE_CANDIDATE_STATE_SUCCEEDED) {
+    agent_connectivity_consent_keepalive(agent, agent->selected_pair);
     return 0;
   }
 
@@ -1753,6 +1791,7 @@ int agent_connectivity_check(Agent* agent) {
 
   if (agent->nominated_pair->state == ICE_CANDIDATE_STATE_SUCCEEDED) {
     agent->selected_pair = agent->nominated_pair;
+    agent_connectivity_consent_keepalive(agent, agent->selected_pair);
     return 0;
   }
 

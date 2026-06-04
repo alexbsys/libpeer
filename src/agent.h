@@ -107,6 +107,11 @@ struct Agent {
   uint16_t turn_cb_channel;
   int turn_cb_pending;
   int turn_cb_ok;
+
+  /* Consent freshness (RFC 7675): keep sending periodic Binding requests on the
+   * selected pair after it succeeds, so the peer can still complete its own check
+   * (relay: first packets may be dropped before the peer installs its permission). */
+  int consent_ticks;
 };
 
 void agent_gather_candidate(Agent* agent, const char* urls, const char* username, const char* credential);
