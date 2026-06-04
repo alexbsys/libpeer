@@ -199,7 +199,66 @@ int udp_socket_recvfrom(UdpSocket* udp_socket, Address* addr, uint8_t* buf, int 
   return ret;
 }
 
+void tcp_socket_rx_reset(TcpSocket* tcp_socket) {
+  if (tcp_socket) {
+    tcp_socket->rx_len = 0;
+  }
+}
+
+int tcp_socket_rx_fill(TcpSocket* tcp_socket) {
+  int space;
+  int r;
+
+  if (!tcp_socket || tcp_socket->fd < 0) {
+    return -1;
+  }
+  space = TCP_SOCKET_RX_CAP - tcp_socket->rx_len;
+  if (space <= 0) {
+    LOGE("TCP rx buffer full");
+    return -1;
+  }
+  r = (int)recv(tcp_socket->fd, tcp_socket->rx_buf + tcp_socket->rx_len, (size_t)space, MSG_DONTWAIT);
+  if (r < 0) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      return 0;
+    }
+    return -1;
+  }
+  if (r == 0) {
+    return -1;
+  }
+  tcp_socket->rx_len += r;
+  return r;
+}
+
+int tcp_socket_read_buffered(TcpSocket* tcp_socket, uint8_t* buf, int len) {
+  int got = 0;
+
+  if (!tcp_socket || tcp_socket->fd < 0 || !buf || len <= 0) {
+    return -1;
+  }
+  while (got < len) {
+    if (tcp_socket->rx_len == 0) {
+      if (tcp_socket_rx_fill(tcp_socket) <= 0) {
+        return got > 0 ? got : -1;
+      }
+    }
+    {
+      int take = len - got;
+      if (take > tcp_socket->rx_len) {
+        take = tcp_socket->rx_len;
+      }
+      memcpy(buf + got, tcp_socket->rx_buf, (size_t)take);
+      memmove(tcp_socket->rx_buf, tcp_socket->rx_buf + take, (size_t)(tcp_socket->rx_len - take));
+      tcp_socket->rx_len -= take;
+      got += take;
+    }
+  }
+  return got;
+}
+
 int tcp_socket_open(TcpSocket* tcp_socket, int family) {
+  tcp_socket_rx_reset(tcp_socket);
   tcp_socket->bind_addr.family = family;
   switch (family) {
     case AF_INET6:
@@ -256,6 +315,14 @@ int tcp_socket_connect(TcpSocket* tcp_socket, Address* addr) {
     tcp_socket_set_recv_timeout_ms(tcp_socket, 50);
   }
 
+  tcp_socket_rx_reset(tcp_socket);
+  {
+    int flags = fcntl(tcp_socket->fd, F_GETFL, 0);
+    if (flags >= 0) {
+      fcntl(tcp_socket->fd, F_SETFL, flags | O_NONBLOCK);
+    }
+  }
+
   LOGI("Server is connected");
   return 0;
 }
@@ -279,24 +346,11 @@ void tcp_socket_close(TcpSocket* tcp_socket) {
     close(tcp_socket->fd);
     tcp_socket->fd = -1;
   }
+  tcp_socket_rx_reset(tcp_socket);
 }
 
 int tcp_socket_recv_exact(TcpSocket* tcp_socket, uint8_t* buf, int len) {
-  int got = 0;
-  if (!tcp_socket || tcp_socket->fd < 0 || !buf || len <= 0) {
-    return -1;
-  }
-  while (got < len) {
-    int r = recv(tcp_socket->fd, buf + got, (size_t)(len - got), 0);
-    if (r < 0) {
-      return -1;
-    }
-    if (r == 0) {
-      return -1;
-    }
-    got += r;
-  }
-  return got;
+  return tcp_socket_read_buffered(tcp_socket, buf, len);
 }
 
 int tcp_socket_send(TcpSocket* tcp_socket, const uint8_t* buf, int len) {
