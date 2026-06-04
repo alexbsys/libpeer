@@ -112,6 +112,18 @@ struct Agent {
    * selected pair after it succeeds, so the peer can still complete its own check
    * (relay: first packets may be dropped before the peer installs its permission). */
   int consent_ticks;
+
+  /* TURN lifetime management: refresh the allocation, permissions and channel binds
+   * before they expire so long sessions survive (RFC 8656 §3.9/§9). */
+  uint32_t turn_alloc_lifetime; /* granted allocation lifetime (s); 0 = unknown/600 */
+  uint32_t turn_alloc_time;     /* epoch (s) of last successful Allocate/Refresh */
+  uint32_t turn_perm_time;      /* epoch (s) of last permission/channel (re)bind */
+
+  /* Relayed media delivery: agent_recv points these at the caller's buffer so the
+   * TURN receive path can hand non-STUN payloads (DTLS/SRTP) back to the app. */
+  uint8_t* media_out;
+  int media_out_cap;
+  int media_out_len;
 };
 
 void agent_gather_candidate(Agent* agent, const char* urls, const char* username, const char* credential);

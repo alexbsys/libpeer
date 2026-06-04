@@ -207,6 +207,11 @@ void stun_parse_msg_buf(StunMessage* msg) {
 
         break;
       case STUN_ATTR_TYPE_LIFETIME:
+        if (ntohs(attr->length) >= 4) {
+          uint32_t lt;
+          memcpy(&lt, attr->value, sizeof(lt));
+          msg->lifetime = ntohl(lt);
+        }
         break;
       case STUN_ATTR_TYPE_REALM:
         memset(msg->realm, 0, sizeof(msg->realm));

@@ -109,6 +109,7 @@ struct StunMessage {
   int use_candidate;
   uint8_t data[256];
   int data_len;
+  uint32_t lifetime; /* TURN LIFETIME attribute (seconds), 0 if absent */
   int error_code;
   char error_reason[64];
   uint8_t buf[STUN_ATTR_BUF_SIZE];

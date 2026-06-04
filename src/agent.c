@@ -39,6 +39,16 @@ static int agent_turn_tcp_poll_recv(Agent* agent, StunMessage* stun_msg);
 static void agent_turn_tcp_drain_media(Agent* agent, int wait_ms);
 static void agent_turn_drain_udp(Agent* agent);
 static void agent_turn_deallocate(Agent* agent);
+static int agent_turn_refresh(Agent* agent, uint32_t lifetime);
+static void agent_turn_refresh_maybe(Agent* agent);
+static int agent_turn_create_permission(Agent* agent, Address* peer);
+static int agent_turn_channel_bind_req(Agent* agent, Address* peer, uint16_t channel);
+static int agent_turn_control_recv_attempts(Agent* agent, StunMessage* recv_msg, int maxtimes);
+static int agent_turn_dispatch_stun_msg(Agent* agent, StunMessage* stun_msg, Address* addr);
+
+/* Default TURN lifetimes (RFC 8656 defaults). Refresh well before expiry. */
+#define AGENT_TURN_DEFAULT_LIFETIME 600u
+#define AGENT_TURN_PERMISSION_LIFETIME 300u
 
 /* RFC 8489: STUN password is the pwd of the ufrag that appears first in USERNAME. */
 static const char* agent_stun_password_for_msg(Agent* agent, const StunMessage* stun_msg) {
@@ -259,10 +269,176 @@ static void agent_turn_deallocate(Agent* agent) {
   agent->turn_cp_pending = 0;
   agent->turn_cb_pending = 0;
   agent->turn_cb_ok = 0;
+  agent->turn_alloc_lifetime = 0;
+  agent->turn_alloc_time = 0;
+  agent->turn_perm_time = 0;
   memset(agent->turn_cp_tid, 0, sizeof(agent->turn_cp_tid));
   memset(agent->turn_cb_tid, 0, sizeof(agent->turn_cb_tid));
   memset(&agent->turn_server, 0, sizeof(agent->turn_server));
   memset(&agent->turn_relay_addr, 0, sizeof(agent->turn_relay_addr));
+}
+
+/* Build a TURN Refresh request with the given lifetime + current credentials. */
+static void agent_turn_build_refresh(Agent* agent, StunMessage* msg, uint32_t lifetime) {
+  uint32_t lt = htonl(lifetime);
+  memset(msg, 0, sizeof(*msg));
+  stun_msg_create(msg, STUN_CLASS_REQUEST | STUN_METHOD_REFRESH);
+  stun_msg_write_attr(msg, STUN_ATTR_TYPE_LIFETIME, sizeof(lt), (char*)&lt);
+  if (agent->turn_username[0]) {
+    stun_msg_write_attr(msg, STUN_ATTR_TYPE_USERNAME, strlen(agent->turn_username), agent->turn_username);
+  }
+  if (agent->turn_nonce[0]) {
+    stun_msg_write_attr(msg, STUN_ATTR_TYPE_NONCE, strlen(agent->turn_nonce), agent->turn_nonce);
+  }
+  if (agent->turn_realm[0]) {
+    stun_msg_write_attr(msg, STUN_ATTR_TYPE_REALM, strlen(agent->turn_realm), agent->turn_realm);
+  }
+  stun_msg_finish(msg, STUN_CREDENTIAL_LONG_TERM, agent->turn_password, strlen(agent->turn_password));
+}
+
+/* Drain the control connection looking for a response to transaction `tid`.
+ * Returns 1 and fills `out` if found within the wait window, else 0. */
+static int agent_turn_wait_response(Agent* agent, const uint8_t* tid, StunMessage* out, int wait_ms) {
+  int waited = 0;
+  while (waited < wait_ms) {
+    StunMessage rx;
+    int ret;
+    memset(&rx, 0, sizeof(rx));
+    ret = agent_turn_control_recv_attempts(agent, &rx, 1);
+    if (ret > 0) {
+      /* Only STUN can be our response; ChannelData media never matches a txn id. */
+      if (stun_probe(rx.buf, (size_t)ret) == 0) {
+        rx.size = (size_t)ret;
+        stun_parse_msg_buf(&rx);
+        if (memcmp(((StunHeader*)rx.buf)->transaction_id, tid, 12) == 0 &&
+            (rx.stunclass == STUN_CLASS_RESPONSE || rx.stunclass == STUN_CLASS_ERROR)) {
+          memcpy(out, &rx, sizeof(rx));
+          return 1;
+        }
+      }
+      /* Not our response — route through the normal path so muxed ICE/STUN is handled
+       * and relayed media (ChannelData/Data indication) is still delivered to the app. */
+      if (!agent->turn_use_tcp) {
+        agent_turn_process_udp_datagram(agent, &agent->turn_server, rx.buf, ret);
+      } else if (stun_probe(rx.buf, (size_t)ret) == 0) {
+        rx.size = (size_t)ret;
+        stun_parse_msg_buf(&rx);
+        agent_turn_dispatch_stun_msg(agent, &rx, &agent->turn_server);
+      }
+      continue; /* keep reading without sleeping while packets are queued */
+    }
+    ports_sleep_ms(10);
+    waited += 10;
+  }
+  return 0;
+}
+
+/* TURN Refresh with stale-nonce (438) retry. lifetime=0 deallocates. Returns 0 on success. */
+static int agent_turn_refresh(Agent* agent, uint32_t lifetime) {
+  StunMessage send_msg;
+  StunMessage resp;
+  int attempt;
+
+  if (!agent->turn_allocated || !agent->turn_server.port) {
+    return -1;
+  }
+  for (attempt = 0; attempt < 2; attempt++) {
+    agent_turn_build_refresh(agent, &send_msg, lifetime);
+    uint8_t tid[12];
+    memcpy(tid, ((StunHeader*)send_msg.buf)->transaction_id, sizeof(tid));
+    if (agent_turn_control_send(agent, send_msg.buf, send_msg.size) < 0) {
+      return -1;
+    }
+    memset(&resp, 0, sizeof(resp));
+    if (!agent_turn_wait_response(agent, tid, &resp, agent->turn_use_tcp ? 600 : 400)) {
+      /* No reply (lifetime=0 best-effort, or transient). Treat non-fatal. */
+      return lifetime == 0 ? 0 : -1;
+    }
+    if (resp.stunclass == STUN_CLASS_RESPONSE) {
+      if (lifetime > 0) {
+        /* Tests pin a short lifetime via AGENT_TURN_REQUEST_LIFETIME so the periodic
+         * Refresh keeps firing (coturn clamps the actual allocation up to its 600 s
+         * minimum and echoes that back). */
+        const char* ov = getenv("AGENT_TURN_REQUEST_LIFETIME");
+        uint32_t pin = (ov && ov[0]) ? (uint32_t)atoi(ov) : 0;
+        agent->turn_alloc_lifetime = pin ? pin : (resp.lifetime ? resp.lifetime : lifetime);
+        agent->turn_alloc_time = ports_get_epoch_time();
+        LOGI("TURN Refresh OK lifetime=%u s (echoed=%u)", agent->turn_alloc_lifetime, resp.lifetime);
+      }
+      return 0;
+    }
+    if (resp.stunclass == STUN_CLASS_ERROR && resp.error_code == 438 && resp.nonce[0]) {
+      /* Stale nonce: adopt the server's fresh nonce/realm and retry once. */
+      strncpy(agent->turn_nonce, resp.nonce, sizeof(agent->turn_nonce) - 1);
+      agent->turn_nonce[sizeof(agent->turn_nonce) - 1] = '\0';
+      if (resp.realm[0]) {
+        strncpy(agent->turn_realm, resp.realm, sizeof(agent->turn_realm) - 1);
+        agent->turn_realm[sizeof(agent->turn_realm) - 1] = '\0';
+      }
+      LOGI("TURN Refresh 438 stale nonce — retrying with fresh nonce");
+      continue;
+    }
+    LOGW("TURN Refresh failed class=0x%x err=%d", resp.stunclass, resp.error_code);
+    return -1;
+  }
+  return -1;
+}
+
+/* Refresh allocation + permissions/channels before they expire. Cheap time-gated. */
+static void agent_turn_refresh_maybe(Agent* agent) {
+  uint32_t now;
+  uint32_t half;
+  const char* disable;
+
+  if (!agent->turn_allocated) {
+    return;
+  }
+  /* Test hook: AGENT_TURN_DISABLE_REFRESH=1 lets the allocation expire (negative case). */
+  disable = getenv("AGENT_TURN_DISABLE_REFRESH");
+  if (disable && disable[0] == '1') {
+    return;
+  }
+  /* ports_get_epoch_time() returns milliseconds; lifetimes are in seconds. */
+  now = ports_get_epoch_time();
+  half = (agent->turn_alloc_lifetime ? agent->turn_alloc_lifetime : AGENT_TURN_DEFAULT_LIFETIME) * 1000u / 2u;
+  if (half < 5000u) {
+    half = 5000u;
+  }
+  if (now - agent->turn_alloc_time >= half) {
+    agent_turn_refresh(agent, agent->turn_alloc_lifetime ? agent->turn_alloc_lifetime
+                                                          : AGENT_TURN_DEFAULT_LIFETIME);
+  }
+  /* Permissions expire after ~300 s; channel binds after ~600 s. Re-issue both at
+   * half the permission lifetime so inbound relay keeps flowing. ChannelBind also
+   * refreshes the underlying permission. AGENT_TURN_PERM_REFRESH_MS overrides the
+   * interval (tests use short coturn channel/permission lifetimes). */
+  uint32_t perm_interval = AGENT_TURN_PERMISSION_LIFETIME * 1000u / 2u;
+  {
+    const char* pe = getenv("AGENT_TURN_PERM_REFRESH_MS");
+    if (pe && pe[0]) {
+      int v = atoi(pe);
+      if (v > 0) {
+        perm_interval = (uint32_t)v;
+      }
+    }
+  }
+  if (now - agent->turn_perm_time >= perm_interval) {
+    int i;
+    int n = agent->turn_channels_count;
+    for (i = 0; i < n; i++) {
+      Address peer = agent->turn_channels[i].peer;
+      uint16_t ch = agent->turn_channels[i].number;
+      if (agent->turn_channels[i].bound && ch >= STUN_CHANNEL_NUMBER_MIN) {
+        agent_turn_channel_bind_req(agent, &peer, ch);
+      } else {
+        agent_turn_create_permission(agent, &peer);
+      }
+    }
+    for (i = 0; i < agent->turn_permissions_count; i++) {
+      agent_turn_create_permission(agent, &agent->turn_permissions[i]);
+    }
+    agent->turn_perm_time = ports_get_epoch_time();
+  }
 }
 
 static int agent_turn_control_recv_attempts(Agent* agent, StunMessage* recv_msg, int maxtimes) {
@@ -412,7 +588,17 @@ static void agent_turn_cp_try_finish_from_response(Agent* agent, StunMessage* st
   }
   if (stun_msg->stunclass == STUN_CLASS_ERROR) {
     agent->turn_cp_pending = 0;
-    LOGW("TURN CreatePermission STUN error");
+    if (stun_msg->error_code == 438 && stun_msg->nonce[0]) {
+      strncpy(agent->turn_nonce, stun_msg->nonce, sizeof(agent->turn_nonce) - 1);
+      agent->turn_nonce[sizeof(agent->turn_nonce) - 1] = '\0';
+      if (stun_msg->realm[0]) {
+        strncpy(agent->turn_realm, stun_msg->realm, sizeof(agent->turn_realm) - 1);
+        agent->turn_realm[sizeof(agent->turn_realm) - 1] = '\0';
+      }
+      LOGI("TURN CreatePermission 438 — refreshed nonce (retry next cycle)");
+      return;
+    }
+    LOGW("TURN CreatePermission STUN error (code=%d)", stun_msg->error_code);
     return;
   }
   if (stun_msg->stunclass != STUN_CLASS_RESPONSE) {
@@ -509,14 +695,25 @@ static void agent_turn_process_channel_payload(Agent* agent, uint16_t channel, c
     return;
   }
   addr_to_string(&peer, peer_str, sizeof(peer_str));
-  LOGI("TURN ChannelData %d B from peer %s:%d (ch=0x%04x)", plen, peer_str, peer.port, (unsigned)channel);
   if (plen > 0 && stun_probe((uint8_t*)payload, (size_t)plen) == 0) {
     StunMessage inner;
+    LOGI("TURN ChannelData %d B STUN from peer %s:%d (ch=0x%04x)", plen, peer_str, peer.port,
+         (unsigned)channel);
     memset(&inner, 0, sizeof(inner));
     memcpy(inner.buf, payload, (size_t)plen);
     inner.size = (size_t)plen;
     stun_parse_msg_buf(&inner);
     agent_process_inbound_stun(agent, &inner, &peer);
+    return;
+  }
+  /* Non-STUN payload = relayed application media (DTLS/SRTP). Hand it to the caller. */
+  if (plen > 0 && agent->media_out && agent->media_out_len == 0 && plen <= agent->media_out_cap) {
+    /* payload may alias the caller buffer (buf+4 -> buf), so memmove. */
+    memmove(agent->media_out, payload, (size_t)plen);
+    agent->media_out_len = plen;
+    LOGD("TURN ChannelData %d B media from peer %s:%d -> app", plen, peer_str, peer.port);
+  } else if (plen > 0) {
+    LOGW("TURN ChannelData %d B media dropped (no app buffer / overflow)", plen);
   }
 }
 
@@ -628,6 +825,16 @@ static void agent_turn_cb_try_finish_from_response(Agent* agent, StunMessage* st
   agent->turn_cb_pending = 0;
   if (stun_msg->stunclass == STUN_CLASS_ERROR) {
     agent->turn_cb_ok = -1;
+    if (stun_msg->error_code == 438 && stun_msg->nonce[0]) {
+      strncpy(agent->turn_nonce, stun_msg->nonce, sizeof(agent->turn_nonce) - 1);
+      agent->turn_nonce[sizeof(agent->turn_nonce) - 1] = '\0';
+      if (stun_msg->realm[0]) {
+        strncpy(agent->turn_realm, stun_msg->realm, sizeof(agent->turn_realm) - 1);
+        agent->turn_realm[sizeof(agent->turn_realm) - 1] = '\0';
+      }
+      LOGI("TURN ChannelBind 438 — refreshed nonce (retry next cycle)");
+      return;
+    }
     if (stun_msg->error_code != 0) {
       LOGW("TURN ChannelBind STUN error %d %s", stun_msg->error_code, stun_msg->error_reason);
     } else {
@@ -843,10 +1050,8 @@ static int agent_turn_send(Agent* agent, Address* peer, const uint8_t* data, int
     return -1;
   }
 
-  /* Use Send/Data indications for both UDP and TCP control. coturn relays ICE back as
-   * indications (not ChannelData) on loopback; ChannelData relay proved unreliable in
-   * pair tests (one direction silently dropped). Indications are slightly larger but
-   * relay reliably in both directions. Set AGENT_TURN_USE_CHANNELDATA=1 to opt back in. */
+  /* ChannelData is the default efficient relay path (see agent_turn_channeldata_enabled).
+   * Set AGENT_TURN_USE_INDICATIONS=1 to fall back to Send/Data indications. */
   if (agent_turn_channeldata_enabled())
   {
   if (!agent_turn_peer_prefers_send(agent, peer)) {
@@ -1173,6 +1378,15 @@ static int agent_create_turn_addr(Agent* agent, Address* serv_addr, const char* 
     stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_USERNAME, strlen(username), (char*)username);
     stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_NONCE, strlen(recv_msg.nonce), recv_msg.nonce);
     stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_REALM, strlen(recv_msg.realm), recv_msg.realm);
+    {
+      /* Test hook: request a short allocation lifetime so expiry/refresh can be
+       * exercised quickly (coturn's max-allocate-lifetime does not cap the default). */
+      const char* req_lt = getenv("AGENT_TURN_REQUEST_LIFETIME");
+      if (req_lt && req_lt[0]) {
+        uint32_t lt = htonl((uint32_t)atoi(req_lt));
+        stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_LIFETIME, sizeof(lt), (char*)&lt);
+      }
+    }
     stun_msg_finish(&send_msg, STUN_CREDENTIAL_LONG_TERM, credential, strlen(credential));
   } else if (recv_msg.stunclass == STUN_CLASS_ERROR) {
     LOGE("TURN Allocate unexpected error class=0x%x method=0x%x", recv_msg.stunclass, recv_msg.stunmethod);
@@ -1214,10 +1428,36 @@ static int agent_create_turn_addr(Agent* agent, Address* serv_addr, const char* 
   agent->turn_permissions_count = 0;
   agent->turn_channels_count = 0;
   agent->turn_next_channel = STUN_CHANNEL_NUMBER_MIN;
+  agent->turn_alloc_lifetime = recv_msg.lifetime ? recv_msg.lifetime : AGENT_TURN_DEFAULT_LIFETIME;
+  {
+    /* Test hook: coturn ignores LIFETIME in Allocate (always grants 600 s) but honours
+     * it in Refresh. Override the effective lifetime so the periodic Refresh requests
+     * (and the refresh cadence) use the short value — lets expiry tests run in ~30 s. */
+    const char* req_lt = getenv("AGENT_TURN_REQUEST_LIFETIME");
+    if (req_lt && req_lt[0]) {
+      agent->turn_alloc_lifetime = (uint32_t)atoi(req_lt);
+    }
+  }
+  agent->turn_alloc_time = ports_get_epoch_time();
+  agent->turn_perm_time = agent->turn_alloc_time;
   memcpy(&agent->turn_relay_addr, &turn_addr, sizeof(Address));
   addr_to_string(&turn_addr, addr_string, sizeof(addr_string));
-  LOGI("TURN relay allocated %s:%d (control=%s)", addr_string, turn_addr.port,
-       agent->turn_use_tcp ? "tcp" : "udp");
+  LOGI("TURN relay allocated %s:%d (control=%s) lifetime=%u s", addr_string, turn_addr.port,
+       agent->turn_use_tcp ? "tcp" : "udp", agent->turn_alloc_lifetime);
+
+  {
+    /* Test hook: coturn ignores the LIFETIME in Allocate (always grants its default),
+     * but honors it in Refresh. Shrink the allocation immediately so expiry/refresh
+     * behavior can be exercised on a 20-30 s timescale. */
+    const char* req_lt = getenv("AGENT_TURN_REQUEST_LIFETIME");
+    if (req_lt && req_lt[0]) {
+      uint32_t want = (uint32_t)atoi(req_lt);
+      if (want > 0) {
+        agent->turn_alloc_lifetime = want;
+        agent_turn_refresh(agent, want);
+      }
+    }
+  }
 
   IceCandidate* ice_candidate = agent->local_candidates + agent->local_candidates_count++;
   ice_candidate_create(ice_candidate, agent->local_candidates_count, ICE_CANDIDATE_TYPE_RELAY, &turn_addr);
@@ -1455,8 +1695,14 @@ static void agent_process_inbound_stun(Agent* agent, StunMessage* stun_msg, Addr
           inner.size = (size_t)stun_msg->data_len;
           stun_parse_msg_buf(&inner);
           agent_process_inbound_stun(agent, &inner, &stun_msg->peer_addr);
+        } else if (agent->media_out && agent->media_out_len == 0 &&
+                   stun_msg->data_len <= agent->media_out_cap) {
+          /* Relayed application media carried in a Data indication. */
+          memcpy(agent->media_out, stun_msg->data, (size_t)stun_msg->data_len);
+          agent->media_out_len = stun_msg->data_len;
+          LOGD("TURN Data indication %d B media -> app", stun_msg->data_len);
         } else {
-          LOGW("TURN indication payload is not STUN (%d bytes)", stun_msg->data_len);
+          LOGW("TURN indication media dropped (%d bytes, no app buffer/overflow)", stun_msg->data_len);
         }
       }
       break;
@@ -1528,8 +1774,26 @@ int agent_recv(Agent* agent, uint8_t* buf, int len) {
   StunMessage stun_msg;
   Address addr;
 
+  /* Expose the caller buffer to the TURN receive path so relayed non-STUN media
+   * (ChannelData / Data indication) can be delivered back to the application. */
+  agent->media_out = buf;
+  agent->media_out_cap = len;
+  agent->media_out_len = 0;
+
+  /* Keep the TURN allocation / permissions / channels alive on long sessions. The
+   * refresh path drains the control socket and may surface relayed media into buf. */
+  agent_turn_refresh_maybe(agent);
+  if (agent->media_out_len > 0) {
+    ret = agent->media_out_len;
+    goto done;
+  }
+
   memset(&stun_msg, 0, sizeof(stun_msg));
   while (agent_turn_tcp_poll_recv(agent, &stun_msg)) {
+    if (agent->media_out_len > 0) {
+      ret = agent->media_out_len;
+      goto done;
+    }
     memset(&stun_msg, 0, sizeof(stun_msg));
   }
   /* Note: do NOT early-return when our pair is SUCCEEDED. We must keep reading the
@@ -1537,7 +1801,8 @@ int agent_recv(Agent* agent, uint8_t* buf, int len) {
    * complete ICE, and (b) deliver media to the caller (peer_connection COMPLETED). */
   if ((ret = agent_socket_recv(agent, &addr, buf, len)) > 0) {
     if (agent_turn_process_udp_datagram(agent, &addr, buf, ret)) {
-      return 0;
+      ret = agent->media_out_len; /* >0 if relayed media was delivered into buf */
+      goto done;
     }
     if (stun_probe(buf, (size_t)len) == 0) {
       memset(&stun_msg, 0, sizeof(stun_msg));
@@ -1549,9 +1814,14 @@ int agent_recv(Agent* agent, uint8_t* buf, int len) {
       } else {
         agent_process_inbound_stun(agent, &stun_msg, &addr);
       }
+      ret = 0;
     }
-    ret = 0;
+    /* else: a direct (non-relay) media datagram is already in buf; return its length. */
   }
+
+done:
+  agent->media_out = NULL;
+  agent->media_out_cap = 0;
   return ret;
 }
 
