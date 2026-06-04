@@ -596,16 +596,6 @@ static int agent_turn_channel_to_peer(Agent* agent, uint16_t channel, Address* p
   return 0;
 }
 
-/* Read one STUN or ChannelData frame on the TURN/TCP socket (blocking up to SO_RCVTIMEO). */
-static int agent_turn_tcp_read_next(Agent* agent, StunMessage* msg, int* is_channel,
-                                    uint16_t* channel_number) {
-  if (!agent->turn_use_tcp || agent->turn_tcp.fd < 0) {
-    return -1;
-  }
-  return stun_tcp_recv_turn_frame(&agent->turn_tcp, msg->buf, (int)sizeof(msg->buf), is_channel,
-                                  channel_number);
-}
-
 static void agent_turn_cb_try_finish_from_response(Agent* agent, StunMessage* stun_msg) {
   int i;
 
@@ -785,24 +775,6 @@ static int agent_turn_peer_prefers_send(Agent* agent, Address* peer) {
     }
   }
   return 0;
-}
-
-static void agent_turn_mark_peer_send(Agent* agent, Address* peer) {
-  int i;
-  for (i = 0; i < agent->turn_channels_count; i++) {
-    if (agent_addr_same(&agent->turn_channels[i].peer, peer)) {
-      agent->turn_channels[i].use_send = 1;
-      return;
-    }
-  }
-  if (agent->turn_channels_count >= AGENT_TURN_MAX_CHANNELS) {
-    return;
-  }
-  i = agent->turn_channels_count++;
-  agent->turn_channels[i].peer = *peer;
-  agent->turn_channels[i].number = 0;
-  agent->turn_channels[i].bound = 0;
-  agent->turn_channels[i].use_send = 1;
 }
 
 static int agent_turn_get_or_bind_channel(Agent* agent, Address* peer, uint16_t* out_ch) {
@@ -1193,7 +1165,7 @@ static int agent_create_turn_addr(Agent* agent, Address* serv_addr, const char* 
     goto fail;
   } else {
     LOGE("Invalid TURN Allocate challenge class=0x%x method=0x%x size=%d", recv_msg.stunclass,
-         recv_msg.stunmethod, recv_msg.size);
+         recv_msg.stunmethod, (int)recv_msg.size);
     goto fail;
   }
 

@@ -86,7 +86,7 @@ int udp_socket_open(UdpSocket* udp_socket, int family, int port) {
       break;
     }
 
-    if (getsockname(udp_socket->fd, sa, &sock_len) < 0) {
+    if ((ret = getsockname(udp_socket->fd, sa, &sock_len)) < 0) {
       LOGE("Get socket info failed");
       break;
     }
@@ -306,6 +306,7 @@ int tcp_socket_connect(TcpSocket* tcp_socket, Address* addr) {
   LOGI("Connecting to server: %s:%d", addr_string, addr->port);
   if ((ret = connect(tcp_socket->fd, sa, sock_len)) < 0) {
     LOGE("Failed to connect to server");
+    tcp_socket_close(tcp_socket);
     return -1;
   }
 
