@@ -91,6 +91,15 @@ struct Agent {
   uint32_t controlled_nom_deadline;
   uint32_t transaction_id[3];
 
+  /* Test-only fault-injection state (see LIBPEER_FAULT_INJECT in agent.c).
+   * fault_armed gates the throttle so it only acts once media is actually
+   * flowing (peer connection COMPLETED) — otherwise the DTLS handshake's own
+   * packets would exhaust the budget and the path would die before it ever
+   * connected. fault_udp_pkts counts UDP media/RTCP packets post-arming. Both
+   * stay 0 when fault injection is disabled. */
+  int      fault_armed;
+  uint32_t fault_udp_pkts;
+
   /* TURN allocation state — ICE checks to relay addrs need Send/Permission. */
   int turn_use_tcp;
   TcpSocket turn_tcp;

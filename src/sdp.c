@@ -59,6 +59,7 @@ void sdp_append_h264_mid(char* sdp,
   sdp_append_bundle_transport_after_c_line(sdp, bundle_transport_or_null);
   sdp_append(sdp, "a=rtcp-fb:%d nack", pt);
   sdp_append(sdp, "a=rtcp-fb:%d nack pli", pt);
+  sdp_append(sdp, "a=rtcp-fb:%d goog-remb", pt);
   sdp_append(sdp,
              "a=fmtp:%d profile-level-id=42e01f;level-asymmetry-allowed=1;packetization-mode=1",
              pt);

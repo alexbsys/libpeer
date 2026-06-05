@@ -107,6 +107,7 @@ typedef struct PeerIceInfo {
   int local_type;         /* IceCandidateType of the selected local cand */
   int remote_type;        /* IceCandidateType of the selected remote cand */
   int state;              /* PeerConnectionState */
+  int ms_since_rtcp_in;   /* ms since last inbound RTCP (-1 if none seen yet) */
   const char* local_type_str;  /* "host"/"srflx"/"prflx"/"relay" */
   const char* remote_type_str;
   const char* transport_str;   /* "udp"/"relay-udp"/"relay-tcp" */
@@ -197,6 +198,17 @@ const char* peer_connection_create_answer(PeerConnection* pc);
  */
 void peer_connection_on_receiver_packet_loss(PeerConnection* pc,
                                              void (*on_receiver_packet_loss)(float fraction_loss, uint32_t total_loss, void* userdata));
+
+/**
+ * @brief Register a callback for remote REMB (Receiver Estimated Maximum
+ *        Bitrate, RFC draft "goog-remb") feedback. Fires whenever a valid
+ *        REMB PSFB arrives, with the estimated available bitrate in bps.
+ *
+ * @param[in] pc PeerConnection.
+ * @param[in] on_remb_bitrate callback function (bitrate in bps + userdata).
+ */
+void peer_connection_on_remb(PeerConnection* pc,
+                             void (*on_remb_bitrate)(uint32_t bitrate_bps, void* userdata));
 
 /**
  * @brief Set the callback function to handle onicecandidate event.

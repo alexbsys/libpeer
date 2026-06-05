@@ -47,6 +47,7 @@ struct PeerConnection {
   void (*oniceconnectionstatechange)(PeerConnectionState state, void* user_data);
   void (*on_connected)(void* userdata);
   void (*on_receiver_packet_loss)(float fraction_loss, uint32_t total_loss, void* user_data);
+  void (*on_remb_bitrate)(uint32_t bitrate_bps, void* user_data);
 
   uint8_t temp_buf[CONFIG_MTU];
   uint8_t agent_buf[CONFIG_MTU];
@@ -69,6 +70,21 @@ struct PeerConnection {
   uint32_t last_pts_us;
   uint32_t rtp_ts_origin_90k;
   int rtp_ts_origin_set;
+
+  /* Outbound RTCP Sender Report (RFC 3550 §6.4.1) for the video SSRC. Counts are
+   * accumulated in the outgoing RTP callback; the report is emitted periodically
+   * from the COMPLETED loop so the browser gets NTP<->RTP anchoring (A/V sync,
+   * accurate getStats) and can echo LSR/DLSR for RTT. */
+  uint32_t vsr_packet_count;
+  uint32_t vsr_octet_count;
+  uint32_t vsr_last_rtp_ts;
+  uint32_t vsr_last_send_ms;
+
+  /* Wall-clock (ms) of the last inbound RTCP packet. A media-path liveness
+   * signal: when we are actively sending video but stop receiving RTCP
+   * (RR/REMB/PLI) the downstream path is likely throttled/dead even if ICE
+   * consent still passes. 0 = no RTCP seen yet. */
+  uint32_t last_rtcp_in_ms;
 };
 
 /* RFC 4588 RTX resend: separate SSRC/PT, OSN + original payload. */
@@ -102,9 +118,60 @@ static int peer_connection_resend_nack_rtp(void* user, const uint8_t* rtp, int l
 
 static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void* user_data) {
   PeerConnection* pc = (PeerConnection*)user_data;
+  /* Tally the video stream for its Sender Report (shared callback also serves
+   * audio, so filter by SSRC). Counts are pre-encryption: packet count and
+   * payload octets (RFC 3550 excludes the 12-byte RTP header), plus the latest
+   * RTP timestamp to anchor the SR's NTP/RTP pair. */
+  if (size >= 12) {
+    const RtpHeader* h = (const RtpHeader*)data;
+    if (ntohl(h->ssrc) == pc->vrtp_encoder.ssrc) {
+      pc->vsr_packet_count++;
+      pc->vsr_octet_count += (uint32_t)(size - 12);
+      pc->vsr_last_rtp_ts = ntohl(h->timestamp);
+    }
+  }
   rtp_nack_cache_store(&pc->nack_cache, data, (int)size);
   dtls_srtp_encrypt_rtp_packet(&pc->dtls_srtp, data, (int*)&size);
   agent_send(&pc->agent, data, size);
+}
+
+/* Emit an RTCP Sender Report for the outbound video SSRC. Cheap: one ~28 B packet
+ * (+SRTCP tag) at PC_SR_INTERVAL_MS. The NTP field uses the monotonic ms clock —
+ * its absolute value need not be real wall time for a single stream; the receiver
+ * echoes the middle 32 bits back via RR for RTT and uses NTP<->RTP to anchor
+ * playout. */
+#define PC_SR_INTERVAL_MS 1000
+static void peer_connection_send_video_sr(PeerConnection* pc) {
+  uint8_t pkt[64];
+  uint32_t now_ms;
+  uint32_t ntp_sec;
+  uint32_t ntp_frac;
+  int len;
+
+  if (pc->state != PEER_CONNECTION_COMPLETED || pc->vsr_packet_count == 0) {
+    return;
+  }
+
+  now_ms = (uint32_t)ports_get_epoch_time();
+  ntp_sec = now_ms / 1000u;
+  ntp_frac = (uint32_t)(((uint64_t)(now_ms % 1000u) << 32) / 1000u);
+
+  pkt[0] = 0x80;                 /* V=2, P=0, RC=0 */
+  pkt[1] = (uint8_t)RTCP_SR;     /* 200 */
+  pkt[2] = 0x00;                 /* length = 6 (28 bytes / 4 - 1) */
+  pkt[3] = 0x06;
+  *(uint32_t*)(pkt + 4) = htonl(pc->vrtp_encoder.ssrc);
+  *(uint32_t*)(pkt + 8) = htonl(ntp_sec);
+  *(uint32_t*)(pkt + 12) = htonl(ntp_frac);
+  *(uint32_t*)(pkt + 16) = htonl(pc->vsr_last_rtp_ts);
+  *(uint32_t*)(pkt + 20) = htonl(pc->vsr_packet_count);
+  *(uint32_t*)(pkt + 24) = htonl(pc->vsr_octet_count);
+  len = 28;
+
+  dtls_srtp_encrypt_rctp_packet(&pc->dtls_srtp, pkt, &len);
+  if (len > 0) {
+    agent_send(&pc->agent, pkt, len);
+  }
 }
 
 /* RTP/RTCP use version 2 in the top two bits (RFC 3550). Those must not be fed to mbedTLS
@@ -199,6 +266,8 @@ static void peer_connection_incoming_rtcp(PeerConnection* pc, uint8_t* buf, size
   RtcpHeader* rtcp_header;
   size_t pos = 0;
 
+  pc->last_rtcp_in_ms = (uint32_t)ports_get_epoch_time();
+
   while (pos < len) {
     rtcp_header = (RtcpHeader*)(buf + pos);
 
@@ -220,6 +289,27 @@ static void peer_connection_incoming_rtcp(PeerConnection* pc, uint8_t* buf, size
         // PLI and FIR
         if ((fmt == 1 || fmt == 4) && pc->config.on_request_keyframe) {
           pc->config.on_request_keyframe(pc->config.user_data);
+        } else if (fmt == 15 && pc->on_remb_bitrate) {
+          /* RFC draft "goog-remb": PSFB (PT=206) with FMT=15. The FCI
+             (offset 12 = 4 hdr + 4 sender SSRC + 4 media SSRC) is:
+               'R','E','M','B'  (4 bytes, unique id)
+               num_ssrc         (1 byte)
+               exp:6 | mantissa:18  (3 bytes, big-endian bitfield)
+               feedback SSRC[]  (4 bytes each)
+             Estimated max bitrate (bps) = mantissa << exp. */
+          size_t block_bytes = 4 * ((size_t)ntohs(rtcp_header->length) + 1u);
+          if (pos + block_bytes <= len && block_bytes >= 12u + 8u) {
+            const uint8_t* fci = buf + pos + 12;
+            if (fci[0] == 'R' && fci[1] == 'E' && fci[2] == 'M' && fci[3] == 'B') {
+              uint8_t exp = (uint8_t)(fci[5] >> 2);
+              uint32_t mantissa = ((uint32_t)(fci[5] & 0x03) << 16) | ((uint32_t)fci[6] << 8) | (uint32_t)fci[7];
+              uint64_t bitrate = (uint64_t)mantissa << exp;
+              if (bitrate > 0xFFFFFFFFull) {
+                bitrate = 0xFFFFFFFFull;
+              }
+              pc->on_remb_bitrate((uint32_t)bitrate, pc->config.user_data);
+            }
+          }
         }
         break;
       }
@@ -306,6 +396,9 @@ int peer_connection_get_ice_info(PeerConnection* pc, PeerIceInfo* info) {
   }
   memset(info, 0, sizeof(*info));
   info->state = pc->state;
+  info->ms_since_rtcp_in = pc->last_rtcp_in_ms
+                               ? (int)((uint32_t)ports_get_epoch_time() - pc->last_rtcp_in_ms)
+                               : -1;
   info->controlling = (pc->agent.mode == AGENT_MODE_CONTROLLING) ? 1 : 0;
   info->turn_allocated = pc->agent.turn_allocated ? 1 : 0;
   info->relay_over_tcp = pc->agent.turn_use_tcp ? 1 : 0;
@@ -407,6 +500,11 @@ PeerConnection* peer_connection_create(PeerConfiguration* config) {
 
   rtp_nack_cache_init(&pc->nack_cache);
   pc->rtx_seq_number = 1;
+  pc->vsr_packet_count = 0;
+  pc->vsr_octet_count = 0;
+  pc->vsr_last_rtp_ts = 0;
+  pc->vsr_last_send_ms = 0;
+  pc->last_rtcp_in_ms = 0;
 
   memset(&pc->sctp, 0, sizeof(pc->sctp));
 
@@ -648,6 +746,11 @@ int peer_connection_loop(PeerConnection* pc) {
         PCL(21);
         LOGI("peer_conn: DTLS-SRTP handshake done — media path ready");
 
+        /* Test-only: arm UDP fault injection now that media is flowing, so the
+         * simulated throttle hits the established stream rather than the
+         * handshake (see LIBPEER_FAULT_INJECT in agent.c). No-op otherwise. */
+        pc->agent.fault_armed = 1;
+
         if (pc->config.datachannel) {
           LOGI("SCTP create socket");
           sctp_create_association(&pc->sctp, &pc->dtls_srtp);
@@ -697,6 +800,11 @@ int peer_connection_loop(PeerConnection* pc) {
       if (CONFIG_KEEPALIVE_TIMEOUT > 0 && (ports_get_epoch_time() - pc->agent.binding_request_time) > CONFIG_KEEPALIVE_TIMEOUT) {
         LOGI("binding request timeout");
         STATE_CHANGED(pc, PEER_CONNECTION_CLOSED);
+      }
+
+      if ((uint32_t)((uint32_t)ports_get_epoch_time() - pc->vsr_last_send_ms) >= PC_SR_INTERVAL_MS) {
+        pc->vsr_last_send_ms = (uint32_t)ports_get_epoch_time();
+        peer_connection_send_video_sr(pc);
       }
 
       break;
@@ -1044,6 +1152,11 @@ void peer_connection_on_connected(PeerConnection* pc, void (*on_connected)(void*
 void peer_connection_on_receiver_packet_loss(PeerConnection* pc,
                                              void (*on_receiver_packet_loss)(float fraction_loss, uint32_t total_loss, void* userdata)) {
   pc->on_receiver_packet_loss = on_receiver_packet_loss;
+}
+
+void peer_connection_on_remb(PeerConnection* pc,
+                             void (*on_remb_bitrate)(uint32_t bitrate_bps, void* userdata)) {
+  pc->on_remb_bitrate = on_remb_bitrate;
 }
 
 void peer_connection_onicecandidate(PeerConnection* pc, void (*onicecandidate)(char* sdp, void* userdata)) {

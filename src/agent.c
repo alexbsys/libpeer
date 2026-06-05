@@ -40,6 +40,43 @@ extern int esp_rom_printf(const char* fmt, ...);
 #define AGENT_TURN_CB_RECV_MS 200
 #define AGENT_TURN_CB_WAIT_MS 800
 
+/* ===========================================================================
+ *  TEST-ONLY fault injection (compile-time). Simulates a mobile-carrier
+ *  DPI/TSPU "soft block": ICE connectivity (STUN consent) keeps passing so the
+ *  path *looks* alive, but media + RTCP over UDP are throttled to zero after a
+ *  handful of packets. The per-agent counter is NOT reset across reconnects'
+ *  sake by design — each fresh session re-establishes, flows ~N packets, then
+ *  dies again, exactly like a real TSPU choke. TCP relay is never affected, so
+ *  failover to TURN-TCP is the only escape — which is what we want to exercise.
+ *
+ *  Enable by building with -DLIBPEER_FAULT_INJECT=1 (optionally override the
+ *  kill threshold with -DLIBPEER_FAULT_UDP_KILL_AFTER=<n>). Off by default. */
+#ifndef LIBPEER_FAULT_INJECT
+#define LIBPEER_FAULT_INJECT 0
+#endif
+#if LIBPEER_FAULT_INJECT
+#ifndef LIBPEER_FAULT_UDP_KILL_AFTER
+#define LIBPEER_FAULT_UDP_KILL_AFTER 120
+#endif
+/* Returns 1 when the (UDP) media/RTCP packet should be dropped to simulate the
+ * throttle. STUN consent never routes through here, so ICE stays "connected".
+ * TCP relay (turn_use_tcp) is exempt. */
+static int agent_fault_drop_udp_media(Agent* agent) {
+  if (!agent || agent->turn_use_tcp || !agent->fault_armed) {
+    return 0; /* TCP relay or pre-COMPLETED handshake: never throttle */
+  }
+  if (agent->fault_udp_pkts < LIBPEER_FAULT_UDP_KILL_AFTER) {
+    agent->fault_udp_pkts++;
+    if (agent->fault_udp_pkts == LIBPEER_FAULT_UDP_KILL_AFTER) {
+      esp_rom_printf("FAULTINJECT: UDP media/RTCP throttled to zero after %d pkts\n",
+                     (int)LIBPEER_FAULT_UDP_KILL_AFTER);
+    }
+    return 0;
+  }
+  return 1;
+}
+#endif /* LIBPEER_FAULT_INJECT */
+
 static void agent_process_inbound_stun(Agent* agent, StunMessage* stun_msg, Address* addr);
 static int agent_turn_channel_to_peer(Agent* agent, uint16_t channel, Address* peer);
 static void agent_turn_cb_try_finish_from_response(Agent* agent, StunMessage* stun_msg);
@@ -1729,6 +1766,11 @@ int agent_send(Agent* agent, const uint8_t* buf, int len) {
   if (!agent->nominated_pair) {
     return -1;
   }
+#if LIBPEER_FAULT_INJECT
+  if (agent_fault_drop_udp_media(agent)) {
+    return len; /* pretend the send succeeded; the packet is silently dropped */
+  }
+#endif
   if (agent_pair_needs_turn(agent->nominated_pair) && agent->turn_allocated) {
     return agent_turn_send(agent, &agent->nominated_pair->remote->addr, buf, len);
   }
@@ -2063,6 +2105,13 @@ int agent_recv(Agent* agent, uint8_t* buf, int len) {
 done:
   agent->media_out = NULL;
   agent->media_out_cap = 0;
+#if LIBPEER_FAULT_INJECT
+  /* Drop inbound media/RTCP (STUN was already handled above and set ret=0, so
+   * consent keeps flowing). Mimics the bidirectional UDP throttle. */
+  if (ret > 0 && agent_fault_drop_udp_media(agent)) {
+    ret = 0;
+  }
+#endif
   return ret;
 }
 
