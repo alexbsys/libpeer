@@ -141,6 +141,12 @@ static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void
  * echoes the middle 32 bits back via RR for RTT and uses NTP<->RTP to anchor
  * playout. */
 #define PC_SR_INTERVAL_MS 1000
+
+/* Max inbound packets drained per COMPLETED loop pass. Lets a batched TURN-TCP
+ * burst (RTP + several RTCP) be consumed in one iteration without letting a flood
+ * starve connectivity-check replies. ~30 fps + a handful of RTCP fits well under
+ * this; raise only if a relay ever batches more than this per loop. */
+#define PC_MAX_RX_PER_LOOP 24
 static void peer_connection_send_video_sr(PeerConnection* pc) {
   uint8_t pkt[64];
   uint32_t now_ms;
@@ -763,7 +769,16 @@ int peer_connection_loop(PeerConnection* pc) {
       break;
     case PEER_CONNECTION_COMPLETED:
       PCL(30);
-      if ((pc->agent_ret = agent_recv(&pc->agent, pc->agent_buf, sizeof(pc->agent_buf))) > 0) {
+      /* Drain ALL inbound packets buffered this pass, not just one. Over a TURN-
+       * TCP relay several datagrams (notably batched RTCP: RR/REMB/NACK) arrive
+       * in one TCP segment; consuming a single one per loop iteration (the loop
+       * can be ~300 ms on a busy relay) starved inbound RTCP and tripped a false
+       * media stall -> spurious failover. Bounded so a flood can't monopolise the
+       * loop and block connectivity-check replies. */
+      for (int rx = 0; rx < PC_MAX_RX_PER_LOOP; rx++) {
+        if ((pc->agent_ret = agent_recv(&pc->agent, pc->agent_buf, sizeof(pc->agent_buf))) <= 0) {
+          break;
+        }
         PCL(31);
         LOGD("agent_recv %d", pc->agent_ret);
 

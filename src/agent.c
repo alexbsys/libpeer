@@ -1992,6 +1992,16 @@ static int agent_turn_tcp_poll_recv(Agent* agent, StunMessage* stun_msg) {
         esp_rom_printf("TCPRX ch=0x%04x plen=%d stun=%d\n", channel, plen, looks_stun);
       }
       agent_turn_process_channel_payload(agent, channel, frame + 4, plen);
+      /* media_out holds ONE relayed payload. Several ChannelData frames (e.g.
+       * batched RTCP — RR/REMB/NACK) routinely arrive in a single TCP segment;
+       * if we kept reading, the next frame would be dropped at "no app buffer /
+       * overflow", starving inbound RTCP and tripping a false media stall. Hand
+       * this payload back now — the remaining frames stay in the TCP stream and
+       * are picked up by the caller's next poll (peer_connection COMPLETED drains
+       * in a loop). STUN control frames carry no media, so keep draining those. */
+      if (agent->media_out && agent->media_out_len > 0) {
+        break;
+      }
       continue;
     }
     /* STUN control message: parse out of the (512 B) StunMessage buffer. */
