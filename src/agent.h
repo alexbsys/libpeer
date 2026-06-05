@@ -115,6 +115,15 @@ struct Agent {
   int turn_channels_count;
   uint16_t turn_next_channel;
 
+  /* Scratch buffer for framing/deframing a full relay datagram (payload up to the
+   * 1400-byte bound + 4-byte ChannelData header + 4-byte padding). Kept off the
+   * task stack: these paths run from the webrtc_bus video-send task (only ~6 KB
+   * stack) and a 1.4 KB stack array there overflowed it (stack protection fault).
+   * Access is serialized by the per-peer lock that already guards agent_send/recv
+   * (required anyway for TURN-TCP stream integrity). UDP-send and TCP-recv never
+   * run in the same session (turn_use_tcp), so one buffer is sufficient. */
+  uint8_t turn_chan_frame[1400 + 4 + 4];
+
   /* CreatePermission reply can arrive while we wait, or be read first by agent_recv (same UDP). */
   uint8_t turn_cp_tid[12];
   Address turn_cp_peer;

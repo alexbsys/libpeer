@@ -184,7 +184,9 @@ static int agent_socket_recv(Agent* agent, Address* addr, uint8_t* buf, int len)
     }
   }
 
+  PCL(3041); /* freeze-hunt: about to select() */
   ret = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+  PCL(3042); /* freeze-hunt: select() returned */
   if (ret < 0) {
     LOGE("select error");
   } else if (ret == 0) {
@@ -193,7 +195,9 @@ static int agent_socket_recv(Agent* agent, Address* addr, uint8_t* buf, int len)
     for (i = 0; i < 2; i++) {
       if (FD_ISSET(agent->udp_sockets[i].fd, &rfds)) {
         memset(buf, 0, len);
+        PCL(3043); /* freeze-hunt: about to recvfrom() */
         ret = udp_socket_recvfrom(&agent->udp_sockets[i], addr, buf, len);
+        PCL(3044); /* freeze-hunt: recvfrom() returned */
         break;
       }
     }
@@ -727,6 +731,9 @@ static void agent_turn_process_channel_payload(Agent* agent, uint16_t channel, c
   char peer_str[ADDRSTRLEN];
 
   if (!agent_turn_channel_to_peer(agent, channel, &peer)) {
+    if (!agent->selected_pair) {
+      esp_rom_printf("CHPL unknown ch=0x%04x plen=%d\n", (unsigned)channel, plen);
+    }
     LOGW("TURN ChannelData unknown ch=0x%04x (%d B)", (unsigned)channel, plen);
     return;
   }
@@ -739,6 +746,11 @@ static void agent_turn_process_channel_payload(Agent* agent, uint16_t channel, c
     memcpy(inner.buf, payload, (size_t)plen);
     inner.size = (size_t)plen;
     stun_parse_msg_buf(&inner);
+    if (!agent->selected_pair) {
+      esp_rom_printf("CHPL stun cls=%d mth=%d uc=%d peer=%u:%u\n", (int)inner.stunclass,
+                     (int)inner.stunmethod, (int)inner.use_candidate,
+                     (unsigned)((uint32_t)peer.sin.sin_addr.s_addr & 0xff), peer.port);
+    }
     agent_process_inbound_stun(agent, &inner, &peer);
     return;
   }
@@ -795,22 +807,22 @@ static void agent_turn_drain_udp(Agent* agent) {
 }
 
 static int agent_turn_udp_send_channel_data(Agent* agent, uint16_t channel, const uint8_t* data, int len) {
-  /* Must hold a full relay datagram: payload (up to the 1400-byte datagram bound
-   * used by the recv path) + 4-byte ChannelData header + up to 3 bytes of 4-byte
-   * padding. STUN_ATTR_BUF_SIZE (512) was far too small: a DTLS handshake flight
-   * carrying our certificate is ~760 B, so stun_pack_channel_data() returned -1
-   * and agent_send() reported a send failure to mbedTLS. mbedTLS then reset the
-   * session (regenerating client_random); the peer's already-sent flight, signed
-   * over the old random, failed signature verification on the retry — surfacing
-   * as the relay-only ECP_VERIFY_FAILED (-0x4e00). */
-  uint8_t frame[1400 + 4 + 3];
+  /* Frame buffer must hold a full relay datagram (payload + 4-byte ChannelData
+   * header + padding). STUN_ATTR_BUF_SIZE (512) was far too small: a DTLS
+   * handshake flight carrying our certificate is ~760 B, so stun_pack_channel_data()
+   * returned -1 and agent_send() reported a send failure to mbedTLS. mbedTLS then
+   * reset the session (regenerating client_random); the peer's already-sent flight,
+   * signed over the old random, failed signature verification on the retry —
+   * surfacing as the relay-only ECP_VERIFY_FAILED (-0x4e00). Uses the off-stack
+   * agent->turn_chan_frame (see agent.h) to keep the webrtc_bus stack small. */
   int total;
 
-  total = stun_pack_channel_data(frame, (int)sizeof(frame), channel, data, len);
+  total = stun_pack_channel_data(agent->turn_chan_frame, (int)sizeof(agent->turn_chan_frame),
+                                 channel, data, len);
   if (total < 0) {
     return -1;
   }
-  return agent_socket_send(agent, &agent->turn_server, frame, total);
+  return agent_socket_send(agent, &agent->turn_server, agent->turn_chan_frame, total);
 }
 
 static int agent_turn_dispatch_stun_msg(Agent* agent, StunMessage* stun_msg, Address* addr) {
@@ -1447,16 +1459,22 @@ static int agent_create_turn_addr(Agent* agent, Address* serv_addr, const char* 
 #if CONFIG_TURN_TCP
   agent->turn_use_tcp = 0;
   if (use_tcp) {
+    uint32_t sip = (uint32_t)serv_addr->sin.sin_addr.s_addr;
+    esp_rom_printf("TURNTCP connect -> %u.%u.%u.%u:%u\n", sip & 0xff, (sip >> 8) & 0xff,
+                   (sip >> 16) & 0xff, (sip >> 24) & 0xff, serv_addr->port);
     agent->turn_tcp.fd = -1;
     if (tcp_socket_open(&agent->turn_tcp, serv_addr->family) < 0) {
+      esp_rom_printf("TURNTCP open FAILED\n");
       LOGE("TURN/TCP socket open failed");
       return -1;
     }
     if (tcp_socket_connect(&agent->turn_tcp, serv_addr) < 0) {
+      esp_rom_printf("TURNTCP connect FAILED\n");
       tcp_socket_close(&agent->turn_tcp);
       return -1;
     }
     agent->turn_use_tcp = 1;
+    esp_rom_printf("TURNTCP connected ok\n");
     LOGI("TURN control transport: TCP");
   } else
 #endif
@@ -1479,6 +1497,7 @@ static int agent_create_turn_addr(Agent* agent, Address* serv_addr, const char* 
   ret = agent_turn_control_recv_attempts(agent, &recv_msg,
                                          agent->turn_use_tcp ? AGENT_TURN_TCP_RECV_MAXTIMES
                                                              : AGENT_STUN_RECV_MAXTIMES);
+  esp_rom_printf("TURNTCP alloc1 ret=%d\n", ret);
   if (ret <= 0) {
     LOGE("Failed to receive TURN Allocate response (ret=%d).", ret);
     goto fail;
@@ -1531,6 +1550,7 @@ static int agent_create_turn_addr(Agent* agent, Address* serv_addr, const char* 
   ret = agent_turn_control_recv_attempts(agent, &recv_msg,
                                          agent->turn_use_tcp ? AGENT_TURN_TCP_RECV_MAXTIMES
                                                              : AGENT_STUN_RECV_MAXTIMES);
+  esp_rom_printf("TURNTCP alloc2 ret=%d\n", ret);
   if (ret <= 0) {
     LOGD("Failed to receive TURN Allocate success.");
     goto fail;
@@ -1538,6 +1558,7 @@ static int agent_create_turn_addr(Agent* agent, Address* serv_addr, const char* 
 
   stun_parse_msg_buf(&recv_msg);
   if (recv_msg.stunclass != STUN_CLASS_RESPONSE) {
+    esp_rom_printf("TURNTCP alloc2 class=0x%x (not response)\n", recv_msg.stunclass);
     LOGE("TURN Allocate failed class=0x%x", recv_msg.stunclass);
     goto fail;
   }
@@ -1566,6 +1587,11 @@ static int agent_create_turn_addr(Agent* agent, Address* serv_addr, const char* 
   agent->turn_perm_time = agent->turn_alloc_time;
   memcpy(&agent->turn_relay_addr, &turn_addr, sizeof(Address));
   addr_to_string(&turn_addr, addr_string, sizeof(addr_string));
+  {
+    uint32_t rip = (uint32_t)turn_addr.sin.sin_addr.s_addr;
+    esp_rom_printf("TURNTCP allocated relay %u.%u.%u.%u:%u tcp=%d\n", rip & 0xff, (rip >> 8) & 0xff,
+                   (rip >> 16) & 0xff, (rip >> 24) & 0xff, turn_addr.port, (int)agent->turn_use_tcp);
+  }
   LOGI("TURN relay allocated %s:%d (control=%s) lifetime=%u s", addr_string, turn_addr.port,
        agent->turn_use_tcp ? "tcp" : "udp", agent->turn_alloc_lifetime);
 
@@ -1753,7 +1779,13 @@ void agent_process_stun_request(Agent* agent, StunMessage* stun_msg, Address* ad
   switch (stun_msg->stunmethod) {
     case STUN_METHOD_BINDING:
       const char* req_pwd = agent_stun_password_for_msg(agent, stun_msg);
-      if (stun_msg_is_valid(stun_msg->buf, stun_msg->size, (char*)req_pwd) == 0) {
+      int _valid = (stun_msg_is_valid(stun_msg->buf, stun_msg->size, (char*)req_pwd) == 0);
+      if (!agent->selected_pair) {
+        esp_rom_printf("STUNREQ valid=%d uc=%d turn=%d user=%s\n", _valid,
+                       (int)stun_msg->use_candidate, (int)agent->turn_allocated,
+                       stun_msg->username[0] ? stun_msg->username : "(none)");
+      }
+      if (_valid) {
         char req_from[ADDRSTRLEN];
         const int settled = agent_inbound_from_selected_pair(agent, addr);
         addr_to_string(addr, req_from, sizeof(req_from));
@@ -1878,10 +1910,26 @@ static int agent_turn_tcp_poll_recv(Agent* agent, StunMessage* stun_msg) {
   int is_channel = 0;
   uint16_t channel = 0;
   int got = 0;
+  /* Frames on the TURN-TCP stream can be ChannelData carrying a full relay
+   * datagram (e.g. a ~760 B DTLS handshake flight with our certificate), which
+   * is far larger than a STUN control message. Read into a datagram-sized buffer:
+   * StunMessage.buf is only STUN_ATTR_BUF_SIZE (512) B, so reading directly into
+   * it made stun_tcp_recv_turn_frame() reject any larger frame (total > bufsize),
+   * silently dropping the relayed DTLS flight and stalling the handshake over the
+   * TCP relay (no video). Uses the off-stack agent->turn_chan_frame (see agent.h)
+   * to avoid a 1.4 KB stack array on the loop/recv path. */
+  uint8_t* frame = agent->turn_chan_frame;
+  const int frame_cap = (int)sizeof(agent->turn_chan_frame);
 
   if (!agent->turn_use_tcp || agent->turn_tcp.fd < 0) {
     return 0;
   }
+  /* Drain any partially-written outbound frame first. tcp_socket_send() never
+   * blocks: under TX backpressure it stashes a frame's unsent tail and returns,
+   * so the tail must be pushed out as the socket drains. This runs in the ICE
+   * loop's TURN drain (under c->mu), exactly when the kernel TX buffer is freeing
+   * up, keeping the ChannelData stream byte-aligned without ever blocking. */
+  (void)tcp_socket_tx_flush(&agent->turn_tcp);
   for (;;) {
     FD_ZERO(&rfds);
     FD_SET(agent->turn_tcp.fd, &rfds);
@@ -1890,17 +1938,28 @@ static int agent_turn_tcp_poll_recv(Agent* agent, StunMessage* stun_msg) {
     if (select(agent->turn_tcp.fd + 1, &rfds, NULL, NULL, &tv) <= 0) {
       break;
     }
-    ret = stun_tcp_recv_turn_frame(&agent->turn_tcp, stun_msg->buf, (int)sizeof(stun_msg->buf),
-                                   &is_channel, &channel);
+    ret = stun_tcp_recv_turn_frame(&agent->turn_tcp, frame, frame_cap, &is_channel, &channel);
     if (ret <= 0) {
       break;
     }
     got = 1;
     if (is_channel) {
-      int plen = (int)(((uint16_t)stun_msg->buf[2] << 8) | stun_msg->buf[3]);
-      agent_turn_process_channel_payload(agent, channel, stun_msg->buf + 4, plen);
+      int plen = (int)(((uint16_t)frame[2] << 8) | frame[3]);
+      if (!agent->selected_pair) {
+        int looks_stun = (plen >= 8 && stun_probe(frame + 4, (size_t)plen) == 0) ? 1 : 0;
+        esp_rom_printf("TCPRX ch=0x%04x plen=%d stun=%d\n", channel, plen, looks_stun);
+      }
+      agent_turn_process_channel_payload(agent, channel, frame + 4, plen);
       continue;
     }
+    /* STUN control message: parse out of the (512 B) StunMessage buffer. */
+    if (!agent->selected_pair) {
+      esp_rom_printf("TCPRX stun ret=%d\n", ret);
+    }
+    if (ret > (int)sizeof(stun_msg->buf)) {
+      continue;
+    }
+    memcpy(stun_msg->buf, frame, (size_t)ret);
     stun_msg->size = (size_t)ret;
     stun_parse_msg_buf(stun_msg);
     agent_turn_dispatch_stun_msg(agent, stun_msg, &stun_msg->peer_addr);
@@ -1914,6 +1973,15 @@ static void agent_turn_tcp_drain_media(Agent* agent, int wait_ms) {
    * advanced on the idle branch, so a steady TCP relay stream could spin here
    * forever and starve the system. */
   uint32_t start = (uint32_t)ports_get_epoch_time();
+  /* wait_ms is a MAX, not a fixed dwell. Stop early once the relay has been idle
+   * for a short grace period: spinning out the full 120-200 ms on every empty
+   * poll made each peer_connection_loop() pass take ~320 ms, which starved the
+   * connected state (slow to answer connectivity checks / RTCP -> browser
+   * re-offers). A frame that lands just after we bail is still picked up on the
+   * next loop iteration (the main loop polls this socket every pass), and the
+   * idle counter resets whenever data arrives so active bursts still drain. */
+  const int idle_break_ms = 30;
+  int idle_ms = 0;
 
   if (!agent->turn_use_tcp || agent->turn_tcp.fd < 0 || wait_ms <= 0) {
     return;
@@ -1924,10 +1992,15 @@ static void agent_turn_tcp_drain_media(Agent* agent, int wait_ms) {
       break;
     }
     if (agent_turn_tcp_poll_recv(agent, &stun_msg)) {
+      idle_ms = 0;
       memset(&stun_msg, 0, sizeof(stun_msg));
       continue;
     }
+    if (idle_ms >= idle_break_ms) {
+      break;
+    }
     ports_sleep_ms(10);
+    idle_ms += 10;
   }
 }
 

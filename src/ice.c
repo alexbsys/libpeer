@@ -119,10 +119,20 @@ int ice_candidate_from_description(IceCandidate* candidate, char* description, c
   }
 
   if (strstr(addrstring, "local") != NULL) {
-    if (mdns_resolve_addr(addrstring, &candidate->addr) == 0) {
-      LOGW("Failed to resolve mDNS address");
-      return -1;
-    }
+    /* Chrome emits mDNS (".local") host candidates per interface to hide local
+     * IPs. Resolving them here calls mdns_resolve_addr(), which fires a real
+     * multicast-DNS query with 1 s select timeouts and 3x5 retries (up to ~15 s,
+     * ~2.7 s seen in the field) — and this runs while the per-peer lock c->mu is
+     * held (lp_send_msg -> peer_connection_add_ice_candidate). That stalled
+     * rtc_loop for seconds per trickled candidate, ICE consent lapsed and the
+     * (TCP) relay dropped/reconnected. For a relay/internet peer these LAN-only
+     * names are unreachable from this device anyway (in relay-only mode host
+     * candidates are unused, and the browser's srflx candidate still offers a
+     * direct path via STUN), so skip them instead of blocking. Revisit only if
+     * same-LAN mDNS direct connectivity is ever required — and then off the
+     * c->mu path. */
+    LOGD("skip mDNS (.local) remote candidate: %s", addrstring);
+    return -1;
   } else if (addr_from_string(addrstring, &candidate->addr) == 0) {
     return -1;
   }

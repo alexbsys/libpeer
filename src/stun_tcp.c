@@ -142,19 +142,21 @@ int stun_tcp_send(TcpSocket* tcp, const uint8_t* buf, int len) {
 
 int stun_tcp_send_channel_data(TcpSocket* tcp, uint16_t channel, const uint8_t* data, int len) {
 
-  uint8_t frame[STUN_ATTR_BUF_SIZE + 4];
-
+  /* Frame buffer must hold a full relay payload + 4-byte ChannelData header +
+   * padding. STUN_ATTR_BUF_SIZE (512) was too small: a DTLS handshake flight
+   * carrying our certificate is ~760 B, so this returned -1 and the relay-TCP
+   * DTLS handshake never completed (no video over TCP relay). The buffer lives in
+   * the TcpSocket (heap) rather than on the stack — see socket.h — because this
+   * runs from the small (~6 KB) webrtc_bus task stack. */
   int total;
 
-
-
-  if (!tcp || tcp->fd < 0 || !data || len <= 0 || len > (int)(sizeof(frame) - 4)) {
+  if (!tcp || tcp->fd < 0 || !data || len <= 0 || len > (int)(sizeof(tcp->tx_frame) - 4)) {
 
     return -1;
 
   }
 
-  total = stun_pack_channel_data(frame, (int)sizeof(frame), channel, data, len);
+  total = stun_pack_channel_data(tcp->tx_frame, (int)sizeof(tcp->tx_frame), channel, data, len);
 
   if (total < 0) {
 
@@ -162,7 +164,7 @@ int stun_tcp_send_channel_data(TcpSocket* tcp, uint16_t channel, const uint8_t* 
 
   }
 
-  return tcp_socket_send(tcp, frame, total);
+  return tcp_socket_send(tcp, tcp->tx_frame, total);
 
 }
 

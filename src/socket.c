@@ -82,6 +82,18 @@ int udp_socket_open(UdpSocket* udp_socket, int family, int port) {
     return -1;
   }
 
+  /* Non-blocking: agent_socket_recv() select()s with a 1 ms timeout and only
+   * then recvfrom()s, but lwIP can report a socket readable yet have the
+   * blocking recvfrom() find no datagram (consumed/exception), which then blocks
+   * forever and freezes rtc_loop (observed as a wedge at PCL phase 304). Same
+   * "never block while holding the per-peer lock" rule the TCP path follows. */
+  {
+    int flags = fcntl(udp_socket->fd, F_GETFL, 0);
+    if (flags >= 0) {
+      fcntl(udp_socket->fd, F_SETFL, flags | O_NONBLOCK);
+    }
+  }
+
   do {
     if ((ret = setsockopt(udp_socket->fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse))) < 0) {
       LOGW("reuse failed. ignore");
@@ -148,6 +160,10 @@ int udp_socket_sendto(UdpSocket* udp_socket, Address* addr, const uint8_t* buf, 
   }
 
   if ((ret = sendto(udp_socket->fd, buf, len, 0, sa, sock_len)) < 0) {
+    if (errno == EWOULDBLOCK || errno == EAGAIN) {
+      /* Non-blocking socket, transient output-queue full: drop quietly. */
+      return -1;
+    }
     LOGE("Failed to sendto: %s", strerror(errno));
     return -1;
   }
@@ -182,6 +198,11 @@ int udp_socket_recvfrom(UdpSocket* udp_socket, Address* addr, uint8_t* buf, int 
   }
 
   if ((ret = recvfrom(udp_socket->fd, buf, len, 0, sa, &sock_len)) < 0) {
+    if (errno == EWOULDBLOCK || errno == EAGAIN) {
+      /* Non-blocking socket, no datagram ready: report "no data" like a select
+       * timeout instead of an error so callers simply move on. */
+      return 0;
+    }
     LOGE("Failed to recvfrom: %s", strerror(errno));
     return -1;
   }
@@ -208,6 +229,8 @@ int udp_socket_recvfrom(UdpSocket* udp_socket, Address* addr, uint8_t* buf, int 
 void tcp_socket_rx_reset(TcpSocket* tcp_socket) {
   if (tcp_socket) {
     tcp_socket->rx_len = 0;
+    tcp_socket->tx_pending_len = 0;
+    tcp_socket->tx_pending_off = 0;
   }
 }
 
@@ -388,6 +411,31 @@ int tcp_socket_recv_exact(TcpSocket* tcp_socket, uint8_t* buf, int len) {
   return tcp_socket_read_buffered(tcp_socket, buf, len);
 }
 
+int tcp_socket_tx_flush(TcpSocket* tcp_socket) {
+  if (!tcp_socket || tcp_socket->fd < 0) {
+    return -1;
+  }
+  while (tcp_socket->tx_pending_off < tcp_socket->tx_pending_len) {
+    int remain = tcp_socket->tx_pending_len - tcp_socket->tx_pending_off;
+    int ret = send(tcp_socket->fd, tcp_socket->tx_pending + tcp_socket->tx_pending_off,
+                   (size_t)remain, MSG_NOSIGNAL);
+    if (ret > 0) {
+      tcp_socket->tx_pending_off += ret;
+      continue;
+    }
+    if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      return 0; /* still backpressured — try again on the next drain/send */
+    }
+    LOGE("Failed to flush TX tail: %s", strerror(errno));
+    tcp_socket->tx_pending_len = 0;
+    tcp_socket->tx_pending_off = 0;
+    return -1;
+  }
+  tcp_socket->tx_pending_len = 0;
+  tcp_socket->tx_pending_off = 0;
+  return 1;
+}
+
 int tcp_socket_send(TcpSocket* tcp_socket, const uint8_t* buf, int len) {
   int sent = 0;
 
@@ -396,13 +444,55 @@ int tcp_socket_send(TcpSocket* tcp_socket, const uint8_t* buf, int len) {
     return -1;
   }
 
+  /* The TURN-over-TCP socket is non-blocking (see tcp_socket_connect), and each
+   * caller hands us one whole TURN frame — a STUN message or a length-prefixed
+   * ChannelData record — in a single call. ChannelData framing is a byte stream:
+   * a frame left *partially* on the wire makes the relay (and the browser behind
+   * it) misparse every following byte, the channel desyncs and the peer drops/
+   * re-offers. Video bursts (an IDR split into many RTP packets) routinely fill
+   * the TCP TX buffer, so short writes / EAGAIN are common here.
+   *
+   * We must never block (this runs under the per-peer lock c->mu; a starved
+   * rtc_loop misses ICE consent and triggers the very drop we are fixing) and
+   * never leave a partial frame. So:
+   *  - First flush any tail left by a previous partial frame. If it cannot fully
+   *    flush yet, drop this new frame (return -1) to preserve byte order — the
+   *    wire stays frame-aligned.
+   *  - send() the frame. On EAGAIN with nothing written, drop cleanly. On a
+   *    partial write, stash the unsent remainder in tx_pending and report success;
+   *    it is flushed later by tcp_socket_tx_flush() (from the loop's TURN drain or
+   *    the next send) without blocking. */
+  if (tcp_socket->tx_pending_len > tcp_socket->tx_pending_off) {
+    if (tcp_socket_tx_flush(tcp_socket) <= 0) {
+      return -1; /* tail still pending (or error): drop new frame, keep order */
+    }
+  }
+
   while (sent < len) {
     int ret = send(tcp_socket->fd, buf + sent, (size_t)(len - sent), MSG_NOSIGNAL);
-    if (ret < 0) {
-      LOGE("Failed to send: %s", strerror(errno));
-      return -1;
+    if (ret > 0) {
+      sent += ret;
+      continue;
     }
-    sent += ret;
+    if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      if (sent == 0) {
+        return -1; /* clean drop: stream still frame-aligned */
+      }
+      {
+        int remain = len - sent;
+        if (remain > (int)sizeof(tcp_socket->tx_pending)) {
+          /* Cannot happen for sane TURN frames, but never overflow the tail. */
+          LOGE("TCP TX tail too large %d — dropping relay frame", remain);
+          return -1;
+        }
+        memcpy(tcp_socket->tx_pending, buf + sent, (size_t)remain);
+        tcp_socket->tx_pending_len = remain;
+        tcp_socket->tx_pending_off = 0;
+      }
+      return len; /* frame accepted; tail flushes asynchronously */
+    }
+    LOGE("Failed to send: %s", strerror(errno));
+    return -1;
   }
   return sent;
 }
