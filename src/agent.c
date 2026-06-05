@@ -14,6 +14,15 @@
 #include "stun_tcp.h"
 #include "utils.h"
 
+/* TEMP freeze-hunt: shared phase tracker (defined in peer_connection.c). */
+extern volatile uint32_t g_pcl_phase;
+#define PCL(p) do { g_pcl_phase = (uint32_t)(p); } while (0)
+extern int esp_rom_printf(const char* fmt, ...);
+
+/* Controlled agent grace period (ms) to wait for the controlling peer's
+ * USE-CANDIDATE before falling back to our own self-selected pair. */
+#define AGENT_CONTROLLED_NOM_WAIT_MS 4000
+
 #define AGENT_POLL_TIMEOUT 1
 #define AGENT_CONNCHECK_MAX 400
 /* Outbound connectivity-check spacing (peer_connection_loop ticks between sends).
@@ -84,6 +93,8 @@ void agent_clear_candidates(Agent* agent) {
   agent->candidate_pairs_num = 0;
   agent->nominated_pair = NULL;
   agent->selected_pair = NULL;
+  agent->remote_nominated = 0;
+  agent->controlled_nom_deadline = 0;
   agent->turn_allocated = 0;
   agent->turn_use_tcp = 0;
   agent->turn_tcp.fd = -1;
@@ -122,6 +133,7 @@ int agent_create(Agent* agent) {
   agent_clear_candidates(agent);
   agent->turn_tcp.fd = -1;
   agent->turn_use_tcp = 0;
+  agent->turn_send_depth = 0;
   memset(agent->remote_ufrag, 0, sizeof(agent->remote_ufrag));
   memset(agent->remote_upwd, 0, sizeof(agent->remote_upwd));
   return 0;
@@ -261,6 +273,8 @@ static void agent_turn_deallocate(Agent* agent) {
   agent->candidate_pairs_num = 0;
   agent->nominated_pair = NULL;
   agent->selected_pair = NULL;
+  agent->remote_nominated = 0;
+  agent->controlled_nom_deadline = 0;
   agent->turn_allocated = 0;
   agent->turn_use_tcp = 0;
   agent->turn_permissions_count = 0;
@@ -299,10 +313,20 @@ static void agent_turn_build_refresh(Agent* agent, StunMessage* msg, uint32_t li
 /* Drain the control connection looking for a response to transaction `tid`.
  * Returns 1 and fills `out` if found within the wait window, else 0. */
 static int agent_turn_wait_response(Agent* agent, const uint8_t* tid, StunMessage* out, int wait_ms) {
-  int waited = 0;
-  while (waited < wait_ms) {
+  /* Bound the wait by WALL-CLOCK, not just the idle (sleep) branch. Under an ICE
+   * connectivity-check flood the relay socket always has a packet ready, so the
+   * old `continue`-without-sleeping path never advanced the counter and never
+   * yielded — rtc_loop would spin at prio 5, starving the watchdog/LCD/video and
+   * appearing to freeze the whole device until the peer stopped flooding. We now
+   * stop at the deadline regardless of traffic and yield periodically. */
+  uint32_t start = (uint32_t)ports_get_epoch_time(); /* ms */
+  int processed = 0;
+  for (;;) {
     StunMessage rx;
     int ret;
+    if ((uint32_t)((uint32_t)ports_get_epoch_time() - start) >= (uint32_t)wait_ms) {
+      break;
+    }
     memset(&rx, 0, sizeof(rx));
     ret = agent_turn_control_recv_attempts(agent, &rx, 1);
     if (ret > 0) {
@@ -325,10 +349,14 @@ static int agent_turn_wait_response(Agent* agent, const uint8_t* tid, StunMessag
         stun_parse_msg_buf(&rx);
         agent_turn_dispatch_stun_msg(agent, &rx, &agent->turn_server);
       }
-      continue; /* keep reading without sleeping while packets are queued */
+      /* Keep draining queued packets fast, but yield every few so a sustained
+       * flood can never monopolise the CPU (deadline above is the hard stop). */
+      if ((++processed & 0x0f) == 0) {
+        ports_sleep_ms(1);
+      }
+      continue;
     }
     ports_sleep_ms(10);
-    waited += 10;
   }
   return 0;
 }
@@ -488,8 +516,12 @@ static int agent_pair_needs_turn(const IceCandidatePair* pair) {
   if (!pair || !pair->local || !pair->remote) {
     return 0;
   }
-  return pair->local->type == ICE_CANDIDATE_TYPE_RELAY ||
-         pair->remote->type == ICE_CANDIDATE_TYPE_RELAY;
+  /* We must use OUR TURN allocation (Send indication / ChannelData) only when
+   * OUR local candidate is the relay. When the remote is a relay but our local
+   * is host/srflx, the remote's relayed transport address is a routable public
+   * address we send to directly — routing it back through our own TURN server
+   * would be an incorrect (and fragile) double-relay. */
+  return pair->local->type == ICE_CANDIDATE_TYPE_RELAY;
 }
 
 static int agent_ipv4_is_site_local(const Address* addr) {
@@ -540,6 +572,10 @@ static int agent_remote_candidate_viable(const Agent* agent, const IceCandidate*
   if (!remote) {
     return 0;
   }
+  /* Relay-only policy is enforced on the *local* side: we gather only our
+   * TURN relay candidate, so every pair egresses through the relay regardless
+   * of the remote candidate type. Remote host/srflx are still acceptable
+   * targets to relay to, so they are not filtered here. */
   if (remote->type != ICE_CANDIDATE_TYPE_HOST || !agent_ipv4_is_site_local(&remote->addr)) {
     return 1;
   }
@@ -731,12 +767,43 @@ static void agent_turn_drain_udp(Agent* agent) {
     if (ret <= 0) {
       break;
     }
-    agent_turn_process_udp_datagram(agent, &addr, buf, ret);
+    if (agent_turn_process_udp_datagram(agent, &addr, buf, ret)) {
+      /* Consumed as TURN traffic (and may have surfaced relayed media into
+       * agent->media_out). Stop if we now have media to hand back. */
+      if (agent->media_out_len > 0) {
+        break;
+      }
+      continue;
+    }
+    /* udp_sockets[] is shared between TURN control and direct (host/srflx) ICE.
+     * A non-TURN datagram read here must NOT be dropped: route ICE STUN to the
+     * inbound handler (binding requests/USE-CANDIDATE/keepalives) and hand direct
+     * media (e.g. a DTLS flight on a host pair) back to the caller via media_out. */
+    if (stun_probe(buf, (size_t)ret) == 0) {
+      StunMessage sm;
+      memset(&sm, 0, sizeof(sm));
+      memcpy(sm.buf, buf, (size_t)ret);
+      sm.size = (size_t)ret;
+      stun_parse_msg_buf(&sm);
+      agent_process_inbound_stun(agent, &sm, &addr);
+    } else if (agent->media_out && agent->media_out_len == 0 && ret <= agent->media_out_cap) {
+      memcpy(agent->media_out, buf, (size_t)ret);
+      agent->media_out_len = ret;
+      break;
+    }
   }
 }
 
 static int agent_turn_udp_send_channel_data(Agent* agent, uint16_t channel, const uint8_t* data, int len) {
-  uint8_t frame[STUN_ATTR_BUF_SIZE + 4];
+  /* Must hold a full relay datagram: payload (up to the 1400-byte datagram bound
+   * used by the recv path) + 4-byte ChannelData header + up to 3 bytes of 4-byte
+   * padding. STUN_ATTR_BUF_SIZE (512) was far too small: a DTLS handshake flight
+   * carrying our certificate is ~760 B, so stun_pack_channel_data() returned -1
+   * and agent_send() reported a send failure to mbedTLS. mbedTLS then reset the
+   * session (regenerating client_random); the peer's already-sent flight, signed
+   * over the old random, failed signature verification on the retry — surfacing
+   * as the relay-only ECP_VERIFY_FAILED (-0x4e00). */
+  uint8_t frame[1400 + 4 + 3];
   int total;
 
   total = stun_pack_channel_data(frame, (int)sizeof(frame), channel, data, len);
@@ -1039,7 +1106,40 @@ static int agent_turn_channeldata_enabled(void) {
   return cached;
 }
 
-static int agent_turn_send(Agent* agent, Address* peer, const uint8_t* data, int len) {
+/* Best-effort relayed send used when agent_turn_send() is re-entered from inside
+ * a TURN wait/dispatch (Agent.turn_send_depth > 0). It NEVER starts a blocking
+ * ChannelBind/CreatePermission handshake — that is exactly what recursed through
+ * agent_turn_wait_response() and overflowed the task stack under connectivity-
+ * check bursts. It uses an already-bound channel if one exists, otherwise a
+ * stateless Send indication. A response sent this way may be dropped by the
+ * server if no permission exists yet; that is harmless because the peer
+ * retransmits its Binding request and the depth-0 path answers it properly. */
+static int agent_turn_send_reentrant(Agent* agent, Address* peer, const uint8_t* data, int len) {
+  StunMessage ind;
+  char xor_peer[32];
+  int xor_len;
+  int i;
+
+  if (agent_turn_channeldata_enabled()) {
+    for (i = 0; i < agent->turn_channels_count; i++) {
+      if (agent->turn_channels[i].bound && !agent->turn_channels[i].use_send &&
+          agent_addr_same(&agent->turn_channels[i].peer, peer)) {
+        if (agent->turn_use_tcp) {
+          return stun_tcp_send_channel_data(&agent->turn_tcp, agent->turn_channels[i].number, data, len);
+        }
+        return agent_turn_udp_send_channel_data(agent, agent->turn_channels[i].number, data, len);
+      }
+    }
+  }
+  memset(&ind, 0, sizeof(ind));
+  stun_msg_create(&ind, STUN_CLASS_INDICATION | STUN_METHOD_SEND);
+  xor_len = agent_turn_write_xor_peer(xor_peer, peer, (StunHeader*)ind.buf);
+  stun_msg_write_attr(&ind, STUN_ATTR_TYPE_XOR_PEER_ADDRESS, xor_len, xor_peer);
+  stun_msg_write_attr(&ind, STUN_ATTR_TYPE_DATA, len, (char*)data);
+  return agent_turn_control_send(agent, ind.buf, ind.size);
+}
+
+static int agent_turn_send_inner(Agent* agent, Address* peer, const uint8_t* data, int len) {
   StunMessage send_msg;
   char xor_peer[32];
   int xor_len;
@@ -1072,7 +1172,12 @@ static int agent_turn_send(Agent* agent, Address* peer, const uint8_t* data, int
         return ret;
       }
       ret = agent_turn_udp_send_channel_data(agent, channel, data, len);
-      agent_turn_drain_udp(agent);
+      /* Do NOT drain here: this runs inside mbedTLS's send callback during the
+       * DTLS handshake (and later for every media write). agent->media_out is
+       * unset in the send context, so draining would read the peer's relayed
+       * response (server flight / media) off the shared socket and drop it,
+       * leaving mbedTLS's f_recv to stall on an incomplete flight (observed as
+       * ECP_VERIFY_FAILED). The dedicated recv path (agent_recv) reads it. */
       return ret;
     }
   }
@@ -1091,11 +1196,30 @@ static int agent_turn_send(Agent* agent, Address* peer, const uint8_t* data, int
 #if CONFIG_TURN_TCP
   if (agent->turn_use_tcp) {
     agent_turn_tcp_drain_media(agent, 80);
-  } else
-#endif
-  {
-    agent_turn_drain_udp(agent);
   }
+#endif
+  /* UDP: do not drain here (send-callback context, media_out unset) — see the
+   * ChannelData path above. The recv path picks up relayed responses. */
+  return ret;
+}
+
+/* Re-entrancy guard around the TURN send path. At depth 0 this is the normal
+ * (working) blocking send. If reached again while a TURN wait/dispatch is in
+ * progress (a relayed Binding request answered mid-handshake), it falls back to
+ * a non-blocking best-effort send so the ChannelBind/wait chain cannot recurse
+ * into itself and overflow the stack. See Agent.turn_send_depth. */
+static int agent_turn_send(Agent* agent, Address* peer, const uint8_t* data, int len) {
+  int ret;
+
+  if (!agent->turn_allocated || !peer || !data || len <= 0) {
+    return -1;
+  }
+  if (agent->turn_send_depth > 0) {
+    return agent_turn_send_reentrant(agent, peer, data, len);
+  }
+  agent->turn_send_depth++;
+  ret = agent_turn_send_inner(agent, peer, data, len);
+  agent->turn_send_depth--;
   return ret;
 }
 
@@ -1483,6 +1607,12 @@ void agent_gather_candidate(Agent* agent, const char* urls, const char* username
   Address resolved_addr;
 
   if (urls == NULL) {
+    /* Relay-only policy: do not gather host candidates — every packet must
+     * traverse a TURN relay (ESP32 test mode / forced-relay deployments). */
+    if (agent->ice_transport_policy == AGENT_ICE_POLICY_RELAY) {
+      LOGI("ICE relay-only: skipping host candidate gathering");
+      return;
+    }
     agent_create_host_addr(agent);
     return;
   }
@@ -1490,6 +1620,27 @@ void agent_gather_candidate(Agent* agent, const char* urls, const char* username
   if (agent_parse_ice_server_url(urls, hostname, sizeof(hostname), &port, &use_tcp) != 0) {
     LOGE("Invalid ICE server URL: %s", urls);
     return;
+  }
+
+  /* Relay-only policy: STUN yields server-reflexive (non-relay) candidates,
+   * which we must not use — skip STUN servers entirely. */
+  if (strncmp(urls, "stun:", 5) == 0 &&
+      agent->ice_transport_policy == AGENT_ICE_POLICY_RELAY) {
+    LOGI("ICE relay-only: skipping STUN server %s", urls);
+    return;
+  }
+
+  /* Relay-protocol restriction: drop TURN servers whose transport does not
+   * match the configured protocol (force UDP-only or TCP-only relays). */
+  if (strncmp(urls, "turn:", 5) == 0) {
+    if (agent->ice_relay_protocol == AGENT_ICE_RELAY_UDP && use_tcp) {
+      LOGI("ICE relay UDP-only: skipping TCP TURN server %s", urls);
+      return;
+    }
+    if (agent->ice_relay_protocol == AGENT_ICE_RELAY_TCP && !use_tcp) {
+      LOGI("ICE relay TCP-only: skipping UDP TURN server %s", urls);
+      return;
+    }
   }
 
   for (i = 0; i < (int)(sizeof(addr_type) / sizeof(addr_type[0])); i++) {
@@ -1621,6 +1772,15 @@ void agent_process_stun_request(Agent* agent, StunMessage* stun_msg, Address* ad
           pair->state = ICE_CANDIDATE_STATE_SUCCEEDED;
           agent->nominated_pair = pair;
           agent->selected_pair = pair;
+          if (!agent->remote_nominated) {
+            uint32_t nip = (uint32_t)addr->sin.sin_addr.s_addr;
+            esp_rom_printf("ICEUSECAND remote=%u.%u.%u.%u:%u lt=%d rt=%d\n",
+                           nip & 0xff, (nip >> 8) & 0xff, (nip >> 16) & 0xff,
+                           (nip >> 24) & 0xff, addr->port,
+                           pair->local ? (int)pair->local->type : -1,
+                           pair->remote ? (int)pair->remote->type : -1);
+          }
+          agent->remote_nominated = 1;
           if (!settled) {
             LOGI("ICE nominated by remote USE-CANDIDATE");
           }
@@ -1750,13 +1910,16 @@ static int agent_turn_tcp_poll_recv(Agent* agent, StunMessage* stun_msg) {
 
 static void agent_turn_tcp_drain_media(Agent* agent, int wait_ms) {
   StunMessage stun_msg;
-  int elapsed = 0;
+  /* Wall-clock bound (see agent_turn_wait_response): the old elapsed counter only
+   * advanced on the idle branch, so a steady TCP relay stream could spin here
+   * forever and starve the system. */
+  uint32_t start = (uint32_t)ports_get_epoch_time();
 
   if (!agent->turn_use_tcp || agent->turn_tcp.fd < 0 || wait_ms <= 0) {
     return;
   }
   memset(&stun_msg, 0, sizeof(stun_msg));
-  while (elapsed < wait_ms) {
+  while ((uint32_t)((uint32_t)ports_get_epoch_time() - start) < (uint32_t)wait_ms) {
     if (agent->nominated_pair && agent->nominated_pair->state == ICE_CANDIDATE_STATE_SUCCEEDED) {
       break;
     }
@@ -1765,7 +1928,6 @@ static void agent_turn_tcp_drain_media(Agent* agent, int wait_ms) {
       continue;
     }
     ports_sleep_ms(10);
-    elapsed += 10;
   }
 }
 
@@ -1782,24 +1944,30 @@ int agent_recv(Agent* agent, uint8_t* buf, int len) {
 
   /* Keep the TURN allocation / permissions / channels alive on long sessions. The
    * refresh path drains the control socket and may surface relayed media into buf. */
+  PCL(300);
   agent_turn_refresh_maybe(agent);
   if (agent->media_out_len > 0) {
     ret = agent->media_out_len;
     goto done;
   }
 
+  PCL(301);
   memset(&stun_msg, 0, sizeof(stun_msg));
   while (agent_turn_tcp_poll_recv(agent, &stun_msg)) {
+    PCL(302);
     if (agent->media_out_len > 0) {
       ret = agent->media_out_len;
       goto done;
     }
     memset(&stun_msg, 0, sizeof(stun_msg));
   }
+  PCL(303);
   /* Note: do NOT early-return when our pair is SUCCEEDED. We must keep reading the
    * socket to (a) respond to the peer's ongoing connectivity checks so its side can
    * complete ICE, and (b) deliver media to the caller (peer_connection COMPLETED). */
+  PCL(304);
   if ((ret = agent_socket_recv(agent, &addr, buf, len)) > 0) {
+    PCL(305);
     if (agent_turn_process_udp_datagram(agent, &addr, buf, ret)) {
       ret = agent->media_out_len; /* >0 if relayed media was delivered into buf */
       goto done;
@@ -1905,6 +2073,8 @@ void agent_update_candidate_pairs(Agent* agent) {
   agent->candidate_pairs_num = 0;
   agent->nominated_pair = NULL;
   agent->selected_pair = NULL;
+  agent->remote_nominated = 0;
+  agent->controlled_nom_deadline = 0;
   for (i = 0; i < agent->local_candidates_count; i++) {
     for (j = 0; j < agent->remote_candidates_count; j++) {
       if (!agent_remote_candidate_viable(agent, &agent->remote_candidates[j])) {
@@ -2094,14 +2264,17 @@ int agent_connectivity_check(Agent* agent) {
     }
     agent_create_binding_request(agent, &msg);
     if (agent_pair_needs_turn(agent->nominated_pair) && agent->turn_allocated) {
+      PCL(120);
       agent_turn_send(agent, &agent->nominated_pair->remote->addr, msg.buf, msg.size);
 #if CONFIG_TURN_TCP
       if (agent->turn_use_tcp) {
+        PCL(121);
         agent_turn_tcp_drain_media(agent, 120);
       } else
 #endif
       {
         for (int u = 0; u < 20; u++) {
+          PCL(122);
           agent_turn_drain_udp(agent);
           if (agent->nominated_pair->state == ICE_CANDIDATE_STATE_SUCCEEDED) {
             break;
@@ -2110,17 +2283,21 @@ int agent_connectivity_check(Agent* agent) {
         }
       }
     } else {
+      PCL(123);
       agent_socket_send(agent, &agent->nominated_pair->remote->addr, msg.buf, msg.size);
     }
   }
 
   for (int drain = 0; drain < 16; drain++) {
+    PCL(124);
     agent_recv(agent, buf, sizeof(buf));
+    PCL(125);
     agent_turn_drain_udp(agent);
     if (agent->nominated_pair->state == ICE_CANDIDATE_STATE_SUCCEEDED) {
       break;
     }
   }
+  PCL(126);
 
   if (agent->nominated_pair->state == ICE_CANDIDATE_STATE_SUCCEEDED) {
     agent->selected_pair = agent->nominated_pair;
@@ -2149,10 +2326,43 @@ int agent_connectivity_check(Agent* agent) {
   return -1;
 }
 
+int agent_ready_to_finalize(Agent* agent) {
+  if (!agent) {
+    return 1;
+  }
+  if (agent->mode == AGENT_MODE_CONTROLLING) {
+    return 1;
+  }
+  if (agent->remote_nominated) {
+    return 1;
+  }
+  /* Controlled and the peer has not nominated yet: hold off committing so we
+   * don't latch a pair (e.g. the fast host<->host one) the peer will abandon.
+   * Arm a grace deadline so a peer that never trickles USE-CANDIDATE still
+   * connects on our own self-selected pair. */
+  uint32_t now = (uint32_t)ports_get_epoch_time();
+  if (agent->controlled_nom_deadline == 0) {
+    agent->controlled_nom_deadline = now + AGENT_CONTROLLED_NOM_WAIT_MS;
+    return 0;
+  }
+  return (int32_t)(now - agent->controlled_nom_deadline) >= 0;
+}
+
 int agent_select_candidate_pair(Agent* agent) {
   int i;
   int best = -1;
   int best_rank = -1;
+
+  /* Once the controlling peer has nominated a pair (USE-CANDIDATE), a controlled
+   * agent must use exactly that pair — re-ranking here could pick a different
+   * (e.g. relay-preferred) pair than the one the peer actually sends media on,
+   * which strands the DTLS handshake. */
+  if (agent->mode == AGENT_MODE_CONTROLLED && agent->remote_nominated &&
+      agent->nominated_pair &&
+      agent->nominated_pair->state == ICE_CANDIDATE_STATE_SUCCEEDED) {
+    agent->selected_pair = agent->nominated_pair;
+    return 0;
+  }
 
   /* Prefer pairs that already passed connectivity — do not keep nominating
    * new FROZEN pairs while SUCCEEDED ones exist (was: S=3 but selected=0). */

@@ -15,6 +15,8 @@
 #include "socket.h"
 #include "utils.h"
 
+extern int esp_rom_printf(const char* fmt, ...);
+
 int dtls_srtp_udp_send(void* ctx, const uint8_t* buf, size_t len) {
   DtlsSrtp* dtls_srtp = (DtlsSrtp*)ctx;
   UdpSocket* udp_socket = (UdpSocket*)dtls_srtp->user_data;
@@ -155,6 +157,9 @@ int dtls_srtp_init(DtlsSrtp* dtls_srtp, DtlsSrtpRole role, void* user_data) {
 
   dtls_srtp->role = role;
   dtls_srtp->state = DTLS_SRTP_STATE_INIT;
+  dtls_srtp->handshaking = 0;
+  dtls_srtp->handshake_started = 0;
+  dtls_srtp->io_configured = 0;
   dtls_srtp->user_data = user_data;
   dtls_srtp->udp_send = dtls_srtp_udp_send;
   dtls_srtp->udp_recv = dtls_srtp_udp_recv;
@@ -375,22 +380,33 @@ static void dtls_srtp_key_derivation_cb(void* context,
 static int dtls_srtp_do_handshake(DtlsSrtp* dtls_srtp) {
   int ret;
 
-  static mbedtls_timing_delay_context timer;
-
-  mbedtls_ssl_set_timer_cb(&dtls_srtp->ssl, &timer, mbedtls_timing_set_delay, mbedtls_timing_get_delay);
+  /* Configure timer/export-keys/BIO exactly once. Re-arming set_timer_cb each
+   * step (this function is now called once per peer_connection_loop iteration)
+   * would reset mbedTLS's DTLS retransmission timer before it can fire, so a lost
+   * handshake fragment would never be retransmitted. The BIO is bound here (not in
+   * dtls_srtp_init) because peer_connection overrides udp_send/udp_recv after init.
+   * These survive mbedtls_ssl_session_reset(), so one configuration covers retries. */
+  if (!dtls_srtp->io_configured) {
+    mbedtls_ssl_set_timer_cb(&dtls_srtp->ssl, &dtls_srtp->timer, mbedtls_timing_set_delay,
+                             mbedtls_timing_get_delay);
 
 #if CONFIG_MBEDTLS_2_X
-  mbedtls_ssl_conf_export_keys_ext_cb(&dtls_srtp->conf, dtls_srtp_key_derivation_cb, dtls_srtp);
+    mbedtls_ssl_conf_export_keys_ext_cb(&dtls_srtp->conf, dtls_srtp_key_derivation_cb, dtls_srtp);
 #else
-  mbedtls_ssl_set_export_keys_cb(&dtls_srtp->ssl, dtls_srtp_key_derivation_cb, dtls_srtp);
+    mbedtls_ssl_set_export_keys_cb(&dtls_srtp->ssl, dtls_srtp_key_derivation_cb, dtls_srtp);
 #endif
 
-  mbedtls_ssl_set_bio(&dtls_srtp->ssl, dtls_srtp, dtls_srtp->udp_send, dtls_srtp->udp_recv, NULL);
+    mbedtls_ssl_set_bio(&dtls_srtp->ssl, dtls_srtp, dtls_srtp->udp_send, dtls_srtp->udp_recv, NULL);
+    dtls_srtp->io_configured = 1;
+  }
 
+  /* Loop only on WANT_WRITE (our send BIO never blocks). WANT_READ is propagated
+   * to the caller so the per-peer lock is released between flights; mbedTLS keeps
+   * its handshake state and the wall-clock timer cb still drives retransmission. */
   do {
     ret = mbedtls_ssl_handshake(&dtls_srtp->ssl);
 
-  } while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
+  } while (ret == MBEDTLS_ERR_SSL_WANT_WRITE);
 
   return ret;
 }
@@ -431,57 +447,76 @@ static int dtls_sha256_fingerprint_equal(const char* a, const char* b) {
   return *a == '\0' && *b == '\0';
 }
 
+/* One DTLS server step. Returns 0 (done), MBEDTLS_ERR_SSL_WANT_READ (in
+ * progress), or a fatal mbedTLS error. Unlike a blocking server we do NOT
+ * session_reset on every entry — that would wipe a half-completed handshake on
+ * each read-timeout. We reset once at the start of an attempt and again only for
+ * the HELLO_VERIFY cookie round-trip. */
 static int dtls_srtp_handshake_server(DtlsSrtp* dtls_srtp) {
+  unsigned char client_ip[] = "test";
   int ret;
 
-  while (1) {
-    unsigned char client_ip[] = "test";
-
+  if (!dtls_srtp->handshake_started) {
     mbedtls_ssl_session_reset(&dtls_srtp->ssl);
-
     mbedtls_ssl_set_client_transport_id(&dtls_srtp->ssl, client_ip, sizeof(client_ip));
-
-    ret = dtls_srtp_do_handshake(dtls_srtp);
-
-    if (ret == MBEDTLS_ERR_SSL_HELLO_VERIFY_REQUIRED) {
-      LOGD("DTLS hello verification requested");
-
-    } else if (ret != 0) {
-      LOGE("failed! mbedtls_ssl_handshake returned -0x%.4x", (unsigned int)-ret);
-
-      break;
-
-    } else {
-      break;
-    }
+    dtls_srtp->handshake_started = 1;
   }
 
-  LOGD("DTLS server handshake done");
+  ret = dtls_srtp_do_handshake(dtls_srtp);
+
+  if (ret == MBEDTLS_ERR_SSL_HELLO_VERIFY_REQUIRED) {
+    /* Stateless cookie exchange: reset, re-arm the transport id and read the
+     * cookie'd ClientHello on the next iteration. */
+    LOGD("DTLS hello verification requested");
+    mbedtls_ssl_session_reset(&dtls_srtp->ssl);
+    mbedtls_ssl_set_client_transport_id(&dtls_srtp->ssl, client_ip, sizeof(client_ip));
+    return MBEDTLS_ERR_SSL_WANT_READ;
+  }
 
   return ret;
 }
 
 static int dtls_srtp_handshake_client(DtlsSrtp* dtls_srtp) {
-  int ret;
-
-  ret = dtls_srtp_do_handshake(dtls_srtp);
-  if (ret != 0) {
-    LOGE("failed! mbedtls_ssl_handshake returned -0x%.4x\n\n", (unsigned int)-ret);
-  }
-
-  LOGD("DTLS client handshake done");
-
-  return ret;
+  dtls_srtp->handshake_started = 1;
+  return dtls_srtp_do_handshake(dtls_srtp);
 }
 
+/* Tear down a failed/finished attempt so the next one starts clean. */
+static void dtls_srtp_handshake_reset(DtlsSrtp* dtls_srtp) {
+  if (dtls_srtp->state == DTLS_SRTP_STATE_CONNECTED) {
+    srtp_dealloc(dtls_srtp->srtp_in);
+    srtp_dealloc(dtls_srtp->srtp_out);
+  }
+  mbedtls_ssl_session_reset(&dtls_srtp->ssl);
+  dtls_srtp->state = DTLS_SRTP_STATE_INIT;
+  dtls_srtp->handshake_started = 0;
+}
+
+/* Drives the DTLS-SRTP handshake one non-blocking step. Returns:
+ *    0  handshake complete and peer fingerprint verified,
+ *    1  in progress — retry on the next loop iteration (state preserved),
+ *   -1  fatal error — torn down, the next call restarts a fresh attempt. */
 int dtls_srtp_handshake(DtlsSrtp* dtls_srtp, Address* addr) {
   int ret;
   dtls_srtp->remote_addr = addr;
+  dtls_srtp->handshaking = 1;
 
   if (dtls_srtp->role == DTLS_SRTP_ROLE_SERVER) {
     ret = dtls_srtp_handshake_server(dtls_srtp);
   } else {
     ret = dtls_srtp_handshake_client(dtls_srtp);
+  }
+
+  if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+    return 1; /* waiting for the next flight */
+  }
+
+  if (ret != 0) {
+    esp_rom_printf("DTLSERR mbedtls=-0x%x role=%d\n", (unsigned int)-ret, (int)dtls_srtp->role);
+    LOGE("DTLS handshake failed: mbedtls -0x%.4x", (unsigned int)-ret);
+    dtls_srtp_handshake_reset(dtls_srtp);
+    dtls_srtp->handshaking = 0;
+    return -1;
   }
 
   const mbedtls_x509_crt* remote_crt;
@@ -492,25 +527,27 @@ int dtls_srtp_handshake(DtlsSrtp* dtls_srtp, Address* addr) {
       LOGE("Actual and Expected Fingerprint mismatch: %s %s",
            dtls_srtp->remote_fingerprint,
            dtls_srtp->actual_remote_fingerprint);
+      dtls_srtp_handshake_reset(dtls_srtp);
+      dtls_srtp->handshaking = 0;
       return -1;
     }
 
   } else {
-    if (ret != 0) {
-      LOGE("no peer certificate after DTLS handshake (mbedtls ret=-0x%.4x); SDP fingerprint was not verified",
-           (unsigned int)-ret);
-    } else if (strlen(dtls_srtp->remote_fingerprint) == 0) {
+    if (strlen(dtls_srtp->remote_fingerprint) == 0) {
       LOGE("no peer certificate and no a=fingerprint:sha-256 in remote SDP");
     } else {
       LOGE("no peer certificate after DTLS handshake (unexpected)");
     }
+    dtls_srtp_handshake_reset(dtls_srtp);
+    dtls_srtp->handshaking = 0;
     return -1;
   }
 
   mbedtls_dtls_srtp_info dtls_srtp_negotiation_result;
   mbedtls_ssl_get_dtls_srtp_negotiation_result(&dtls_srtp->ssl, &dtls_srtp_negotiation_result);
 
-  return ret;
+  dtls_srtp->handshaking = 0;
+  return 0;
 }
 
 void dtls_srtp_reset_session(DtlsSrtp* dtls_srtp) {

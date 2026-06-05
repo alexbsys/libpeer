@@ -22,6 +22,18 @@
     pc->state = curr_state;                                           \
   }
 
+/* TEMP freeze-hunt: phase tracker. g_pcl_seq increments once per loop entry;
+ * g_pcl_phase is set to a checkpoint id before/after each potentially-blocking
+ * call. An independent lock-free heartbeat task (esp_peer_libpeer_default.c)
+ * prints these via esp_rom_printf, so if peer_connection_loop() ever stops
+ * returning, the last phase pinpoints the exact call that hung. Remove once fixed. */
+volatile uint32_t g_pcl_seq = 0;
+volatile uint32_t g_pcl_phase = 0;
+#define PCL(p) do { g_pcl_phase = (uint32_t)(p); } while (0)
+
+/* TEMP freeze-hunt: lock-free UART print (bypasses wedged stdout lock). */
+extern int esp_rom_printf(const char* fmt, ...);
+
 struct PeerConnection {
   PeerConfiguration config;
   PeerConnectionState state;
@@ -103,30 +115,61 @@ static int peer_connection_looks_like_rtp_or_rtcp(const uint8_t* buf, int n) {
 }
 
 static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t len) {
-  int recv_max = 0;
   int ret = -1;
   DtlsSrtp* dtls_srtp = (DtlsSrtp*)ctx;
   PeerConnection* pc = (PeerConnection*)dtls_srtp->user_data;
-  const int handshake_phase = (dtls_srtp->state != DTLS_SRTP_STATE_CONNECTED);
+  const int handshake_phase = dtls_srtp->handshaking;
+  /* Wall-clock bound for one DTLS read. This callback runs synchronously inside
+   * peer_connection_loop() while the per-peer lock is held, so it must return
+   * promptly to keep the lock free for video/UI/signaling. During the handshake
+   * we return MBEDTLS_ERR_SSL_WANT_READ on timeout (NOT 0 — mbedTLS reads 0 as
+   * connection EOF and aborts): mbedTLS preserves handshake state, the loop
+   * releases the lock, and the next iteration resumes the same handshake so a
+   * multi-datagram flight (e.g. the server flight over a TURN relay) is
+   * accumulated across iterations instead of being reset every timeout. Outside
+   * the handshake (datachannel reads) we keep the original return so callers that
+   * loop on WANT_READ don't spin. */
+  const uint32_t deadline_ms = 200;
+  uint32_t start = (uint32_t)ports_get_epoch_time();
+  int iters = 0;
+
+  if (handshake_phase) {
+    esp_rom_printf("DTLSRXenter len=%u\n", (unsigned)len);
+  }
 
   if (pc->agent_ret > 0 && pc->agent_ret <= len) {
     memcpy(buf, pc->agent_buf, pc->agent_ret);
     return pc->agent_ret;
   }
 
-  while (recv_max < CONFIG_TLS_READ_TIMEOUT && pc->state == PEER_CONNECTION_CONNECTED) {
+  while (pc->state == PEER_CONNECTION_CONNECTED &&
+         (uint32_t)((uint32_t)ports_get_epoch_time() - start) < deadline_ms) {
     ret = agent_recv(&pc->agent, buf, len);
+    iters++;
 
     if (ret > 0) {
       if (handshake_phase && peer_connection_looks_like_rtp_or_rtcp(buf, ret)) {
         LOGD("skip RTP/RTCP (%d B) during DTLS handshake", ret);
         ret = -1;
       } else {
+        if (handshake_phase) {
+          esp_rom_printf("DTLSRX got %d B after %d iters\n", ret, iters);
+        }
         break;
       }
     }
-
-    recv_max++;
+    /* Yield periodically: a STUN/connectivity flood on this socket makes
+     * agent_recv() return immediately every time (no select() wait), which
+     * would CPU-starve video/UI/signaling for the whole deadline. */
+    if ((iters & 0x1f) == 0) {
+      ports_sleep_ms(1);
+    }
+  }
+  if (handshake_phase && ret <= 0) {
+    esp_rom_printf("DTLSRX timeout iters=%d\n", iters);
+    /* No data this window: tell mbedTLS to wait (and let it drive retransmission
+     * via the timer cb) rather than signalling EOF. */
+    return MBEDTLS_ERR_SSL_WANT_READ;
   }
   return ret;
 }
@@ -136,7 +179,20 @@ static int peer_connection_dtls_srtp_send(void* ctx, const uint8_t* buf, size_t 
   PeerConnection* pc = (PeerConnection*)dtls_srtp->user_data;
 
   // LOGD("send %.4x %.4x, %ld", *(uint16_t*)buf, *(uint16_t*)(buf + 2), len);
-  return agent_send(&pc->agent, buf, len);
+  int sret = agent_send(&pc->agent, buf, len);
+  if (pc->dtls_srtp.handshaking) {
+    esp_rom_printf("DTLSTX sret=%d len=%u ct=%u\n", sret, (unsigned)len,
+                   (len > 0) ? (unsigned)buf[0] : 0u);
+  }
+  /* mbedTLS's BIO send callback must report the number of *payload* bytes
+   * accepted, not the wire bytes. agent_send() over a TURN relay returns the
+   * framed size (payload + ChannelData/Send header), which is > len; mbedTLS
+   * treats a return > len as a fault and aborts the handshake. Clamp success to
+   * len (datagram sends are atomic, so sret > 0 means the whole flight went). */
+  if (sret > 0) {
+    return (int)len;
+  }
+  return sret;
 }
 
 static void peer_connection_incoming_rtcp(PeerConnection* pc, uint8_t* buf, size_t len) {
@@ -219,6 +275,106 @@ PeerConnectionState peer_connection_get_state(PeerConnection* pc) {
   return pc->state;
 }
 
+static const char* peer_ice_candidate_type_str(int type) {
+  switch (type) {
+    case ICE_CANDIDATE_TYPE_HOST:
+      return "host";
+    case ICE_CANDIDATE_TYPE_SRFLX:
+      return "srflx";
+    case ICE_CANDIDATE_TYPE_PRFLX:
+      return "prflx";
+    case ICE_CANDIDATE_TYPE_RELAY:
+      return "relay";
+    default:
+      return "?";
+  }
+}
+
+static void peer_ice_format_addr(const Address* addr, char* out, size_t out_len) {
+  char ip[ADDRSTRLEN];
+  if (!addr) {
+    snprintf(out, out_len, "-");
+    return;
+  }
+  addr_to_string(addr, ip, sizeof(ip));
+  snprintf(out, out_len, "%s:%d", ip, addr->port);
+}
+
+int peer_connection_get_ice_info(PeerConnection* pc, PeerIceInfo* info) {
+  if (!pc || !info) {
+    return -1;
+  }
+  memset(info, 0, sizeof(*info));
+  info->state = pc->state;
+  info->controlling = (pc->agent.mode == AGENT_MODE_CONTROLLING) ? 1 : 0;
+  info->turn_allocated = pc->agent.turn_allocated ? 1 : 0;
+  info->relay_over_tcp = pc->agent.turn_use_tcp ? 1 : 0;
+  info->local_type_str = "-";
+  info->remote_type_str = "-";
+  info->transport_str = "none";
+  snprintf(info->local_addr, sizeof(info->local_addr), "-");
+  snprintf(info->remote_addr, sizeof(info->remote_addr), "-");
+
+  IceCandidatePair* pair = pc->agent.nominated_pair;
+  if (!pair) {
+    pair = pc->agent.selected_pair;
+  }
+  if (pair && pair->local && pair->remote) {
+    info->connected = 1;
+    info->local_type = pair->local->type;
+    info->remote_type = pair->remote->type;
+    info->local_type_str = peer_ice_candidate_type_str(pair->local->type);
+    info->remote_type_str = peer_ice_candidate_type_str(pair->remote->type);
+    info->via_relay = (pair->local->type == ICE_CANDIDATE_TYPE_RELAY ||
+                       pair->remote->type == ICE_CANDIDATE_TYPE_RELAY)
+                          ? 1
+                          : 0;
+    peer_ice_format_addr(&pair->local->addr, info->local_addr, sizeof(info->local_addr));
+    peer_ice_format_addr(&pair->remote->addr, info->remote_addr, sizeof(info->remote_addr));
+    if (info->via_relay) {
+      info->transport_str = info->relay_over_tcp ? "relay-tcp" : "relay-udp";
+    } else {
+      info->transport_str = "udp";
+    }
+  }
+  return 0;
+}
+
+/* Log the selected ICE path. Reads the pair directly with no large locals so
+ * it adds negligible stack to the (stack-tight) peer_connection_loop() frame
+ * that runs the SDP/gather path. The full address detail stays available via
+ * peer_connection_get_ice_info() for programmatic callers. */
+static void peer_connection_log_selected_ice(PeerConnection* pc) {
+  IceCandidatePair* pair = pc->agent.nominated_pair;
+  if (!pair) {
+    pair = pc->agent.selected_pair;
+  }
+  if (!pair || !pair->local || !pair->remote) {
+    return;
+  }
+  int relay = (pair->local->type == ICE_CANDIDATE_TYPE_RELAY ||
+               pair->remote->type == ICE_CANDIDATE_TYPE_RELAY);
+  LOGI("ICE selected: transport=%s local=%s remote=%s role=%s turn_alloc=%d",
+       relay ? (pc->agent.turn_use_tcp ? "relay-tcp" : "relay-udp") : "udp",
+       peer_ice_candidate_type_str(pair->local->type),
+       peer_ice_candidate_type_str(pair->remote->type),
+       pc->agent.mode == AGENT_MODE_CONTROLLING ? "controlling" : "controlled",
+       pc->agent.turn_allocated);
+  /* TEMP freeze-hunt: lock-free mirror, survives a wedged stdout lock. */
+  uint32_t lip = (uint32_t)pair->local->addr.sin.sin_addr.s_addr;
+  uint32_t rip = (uint32_t)pair->remote->addr.sin.sin_addr.s_addr;
+  esp_rom_printf(
+      "DTLSPATH selected transport=%s local=%s(%u.%u.%u.%u:%u) "
+      "remote=%s(%u.%u.%u.%u:%u) role=%s turn=%d remote_nom=%d\n",
+      relay ? (pc->agent.turn_use_tcp ? "relay-tcp" : "relay-udp") : "udp",
+      peer_ice_candidate_type_str(pair->local->type),
+      lip & 0xff, (lip >> 8) & 0xff, (lip >> 16) & 0xff, (lip >> 24) & 0xff, pair->local->addr.port,
+      peer_ice_candidate_type_str(pair->remote->type),
+      rip & 0xff, (rip >> 8) & 0xff, (rip >> 16) & 0xff, (rip >> 24) & 0xff, pair->remote->addr.port,
+      pc->agent.mode == AGENT_MODE_CONTROLLING ? "controlling" : "controlled",
+      pc->agent.turn_allocated, pc->agent.remote_nominated);
+}
+
 void* peer_connection_get_sctp(PeerConnection* pc) {
   return &pc->sctp;
 }
@@ -234,6 +390,19 @@ PeerConnection* peer_connection_create(PeerConfiguration* config) {
   if (agent_create(&pc->agent) < 0) {
     free(pc);
     return NULL;
+  }
+
+  /* Propagate ICE behavior policy (relay-only / relay transport) to the agent
+   * so gathering and pairing honor it. */
+  pc->agent.ice_transport_policy = (int)pc->config.ice_transport_policy;
+  pc->agent.ice_relay_protocol = (int)pc->config.ice_relay_protocol;
+  if (pc->agent.ice_transport_policy == AGENT_ICE_POLICY_RELAY ||
+      pc->agent.ice_relay_protocol != AGENT_ICE_RELAY_ANY) {
+    LOGI("ICE policy: transport=%s relay_proto=%s",
+         pc->agent.ice_transport_policy == AGENT_ICE_POLICY_RELAY ? "relay-only" : "all",
+         pc->agent.ice_relay_protocol == AGENT_ICE_RELAY_UDP   ? "udp"
+         : pc->agent.ice_relay_protocol == AGENT_ICE_RELAY_TCP ? "tcp"
+                                                               : "any");
   }
 
   rtp_nack_cache_init(&pc->nack_cache);
@@ -431,6 +600,8 @@ static char* peer_connection_dtls_role_setup_value(DtlsSrtpRole d) {
 
 int peer_connection_loop(PeerConnection* pc) {
   uint32_t ssrc = 0;
+  g_pcl_seq++;
+  PCL(1);
   memset(pc->agent_buf, 0, sizeof(pc->agent_buf));
   pc->agent_ret = -1;
 
@@ -439,18 +610,42 @@ int peer_connection_loop(PeerConnection* pc) {
       break;
 
     case PEER_CONNECTION_CHECKING:
+      PCL(10);
       if (agent_select_candidate_pair(&pc->agent) < 0) {
+        PCL(11);
         agent_log_ice_diagnostics(&pc->agent, "select_pair -> FAILED (no usable ICE pair)");
         STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
-      } else if (agent_connectivity_check(&pc->agent) == 0) {
-        LOGI("peer_conn: ICE nominated pair succeeded — starting DTLS-SRTP");
-        STATE_CHANGED(pc, PEER_CONNECTION_CONNECTED);
+      } else {
+        PCL(12);
+        if (agent_connectivity_check(&pc->agent) == 0 &&
+            agent_ready_to_finalize(&pc->agent)) {
+          PCL(13);
+          LOGI("peer_conn: ICE nominated pair succeeded — starting DTLS-SRTP");
+          /* Keep the large PeerIceInfo off this (stack-tight) loop frame — see
+           * peer_connection_log_selected_ice(). */
+          peer_connection_log_selected_ice(pc);
+          STATE_CHANGED(pc, PEER_CONNECTION_CONNECTED);
+        }
       }
+      PCL(14);
       break;
 
     case PEER_CONNECTION_CONNECTED:
 
-      if (dtls_srtp_handshake(&pc->dtls_srtp, NULL) == 0) {
+      PCL(20);
+      {
+        int _hs = dtls_srtp_handshake(&pc->dtls_srtp, NULL);
+        if (_hs != 1) { /* skip in-progress spam; log only done(0)/fatal(-1) */
+          esp_rom_printf("DTLSHS ret=%d state=%d role=%d\n", _hs, (int)pc->dtls_srtp.state,
+                         (int)pc->dtls_srtp.role);
+        }
+        if (_hs != 0) {
+          PCL(22);
+          break;
+        }
+      }
+      {
+        PCL(21);
         LOGI("peer_conn: DTLS-SRTP handshake done — media path ready");
 
         if (pc->config.datachannel) {
@@ -461,9 +656,12 @@ int peer_connection_loop(PeerConnection* pc) {
 
         STATE_CHANGED(pc, PEER_CONNECTION_COMPLETED);
       }
+      PCL(22);
       break;
     case PEER_CONNECTION_COMPLETED:
+      PCL(30);
       if ((pc->agent_ret = agent_recv(&pc->agent, pc->agent_buf, sizeof(pc->agent_buf))) > 0) {
+        PCL(31);
         LOGD("agent_recv %d", pc->agent_ret);
 
         if (rtcp_probe(pc->agent_buf, pc->agent_ret)) {
@@ -512,6 +710,7 @@ int peer_connection_loop(PeerConnection* pc) {
       break;
   }
 
+  PCL(99);
   return 0;
 }
 

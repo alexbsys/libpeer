@@ -69,12 +69,62 @@ typedef struct IceServer {
 
 } IceServer;
 
+/**
+ * @brief ICE transport policy (mirrors WebRTC RTCIceTransportPolicy).
+ *
+ * RELAY forces all traffic through a TURN relay: host/server-reflexive
+ * local candidates are not gathered and non-relay remote candidates are
+ * ignored when forming pairs.
+ */
+typedef enum IceTransportPolicy {
+  ICE_TRANSPORT_POLICY_ALL = 0,   /* host + srflx + relay (default) */
+  ICE_TRANSPORT_POLICY_RELAY = 1, /* relay candidates only */
+} IceTransportPolicy;
+
+/**
+ * @brief Restrict which TURN relay transport is used during gathering.
+ *
+ * When set to UDP/TCP, TURN servers whose URL transport does not match are
+ * skipped even if they are present in the ICE server list (e.g. force the
+ * device onto TCP relays only). Has no effect on STUN/host candidates.
+ */
+typedef enum IceRelayProtocol {
+  ICE_RELAY_PROTOCOL_ANY = 0, /* use both turn:(udp) and turn:?transport=tcp */
+  ICE_RELAY_PROTOCOL_UDP = 1, /* only allocate UDP relays */
+  ICE_RELAY_PROTOCOL_TCP = 2, /* only allocate TCP relays */
+} IceRelayProtocol;
+
+/**
+ * @brief Snapshot of the currently selected ICE path (debug / status).
+ * Populated by peer_connection_get_ice_info().
+ */
+typedef struct PeerIceInfo {
+  int connected;          /* 1 if a candidate pair has been selected */
+  int via_relay;          /* 1 if the selected pair uses a TURN relay */
+  int relay_over_tcp;     /* 1 if the TURN control transport is TCP */
+  int turn_allocated;     /* 1 if a TURN allocation is currently held */
+  int controlling;        /* 1 if local agent is in CONTROLLING role */
+  int local_type;         /* IceCandidateType of the selected local cand */
+  int remote_type;        /* IceCandidateType of the selected remote cand */
+  int state;              /* PeerConnectionState */
+  const char* local_type_str;  /* "host"/"srflx"/"prflx"/"relay" */
+  const char* remote_type_str;
+  const char* transport_str;   /* "udp"/"relay-udp"/"relay-tcp" */
+  char local_addr[64];    /* "ip:port" of selected local candidate */
+  char remote_addr[64];   /* "ip:port" of selected remote candidate */
+} PeerIceInfo;
+
 typedef struct PeerConfiguration {
   IceServer ice_servers[5];
 
   MediaCodec audio_codec;
   MediaCodec video_codec;
   DataChannelType datachannel;
+
+  /* ICE behavior knobs (see enums above). Zero-initialized config keeps the
+   * historical defaults: ICE_TRANSPORT_POLICY_ALL + ICE_RELAY_PROTOCOL_ANY. */
+  IceTransportPolicy ice_transport_policy;
+  IceRelayProtocol ice_relay_protocol;
 
   void (*onaudiotrack)(uint8_t* data, size_t size, void* userdata);
   void (*onvideotrack)(uint8_t* data, size_t size, void* userdata);
@@ -88,6 +138,13 @@ typedef struct PeerConnection PeerConnection;
 const char* peer_connection_state_to_string(PeerConnectionState state);
 
 PeerConnectionState peer_connection_get_state(PeerConnection* pc);
+
+/**
+ * @brief Fill `info` with a snapshot of the active ICE path (selected pair,
+ *        transport, relay usage, role). Useful for status reporting / tests.
+ * @return 0 on success, -1 on invalid arguments.
+ */
+int peer_connection_get_ice_info(PeerConnection* pc, PeerIceInfo* info);
 
 void* peer_connection_get_sctp(PeerConnection* pc);
 

@@ -8,6 +8,12 @@
 #include "socket.h"
 #include "utils.h"
 
+/* Bound for non-blocking TCP connect (TURN-over-TCP control channel). Keep it
+ * short: it runs under the per-peer lock, so a long stall freezes other tasks. */
+#ifndef TCP_CONNECT_TIMEOUT_MS
+#define TCP_CONNECT_TIMEOUT_MS 4000
+#endif
+
 int udp_socket_add_multicast_group(UdpSocket* udp_socket, Address* mcast_addr) {
   int ret = 0;
   struct ip_mreq imreq = {0};
@@ -304,7 +310,40 @@ int tcp_socket_connect(TcpSocket* tcp_socket, Address* addr) {
 
   addr_to_string(addr, addr_string, sizeof(addr_string));
   LOGI("Connecting to server: %s:%d", addr_string, addr->port);
-  if ((ret = connect(tcp_socket->fd, sa, sock_len)) < 0) {
+
+  /* Non-blocking connect with a bounded timeout. A plain blocking connect() to an
+   * unreachable/filtered TURN-over-TCP server stalls on the lwip SYN-retransmit
+   * timer for ~60-75 s. libpeer runs this from peer_connection_loop/create_answer
+   * while the per-peer lock is held, so that one connect froze every task that
+   * funnels through the lock (video, signaling/candidates, LCD). Cap it. */
+  {
+    int flags = fcntl(tcp_socket->fd, F_GETFL, 0);
+    if (flags >= 0) {
+      fcntl(tcp_socket->fd, F_SETFL, flags | O_NONBLOCK);
+    }
+  }
+  ret = connect(tcp_socket->fd, sa, sock_len);
+  if (ret < 0 && errno == EINPROGRESS) {
+    fd_set wfds;
+    struct timeval tv;
+    int so_err = 0;
+    socklen_t so_len = sizeof(so_err);
+    FD_ZERO(&wfds);
+    FD_SET(tcp_socket->fd, &wfds);
+    tv.tv_sec = TCP_CONNECT_TIMEOUT_MS / 1000;
+    tv.tv_usec = (TCP_CONNECT_TIMEOUT_MS % 1000) * 1000;
+    ret = select(tcp_socket->fd + 1, NULL, &wfds, NULL, &tv);
+    if (ret <= 0) {
+      LOGE("TCP connect to %s:%d timed out (%d ms)", addr_string, addr->port, TCP_CONNECT_TIMEOUT_MS);
+      tcp_socket_close(tcp_socket);
+      return -1;
+    }
+    if (getsockopt(tcp_socket->fd, SOL_SOCKET, SO_ERROR, &so_err, &so_len) < 0 || so_err != 0) {
+      LOGE("TCP connect to %s:%d failed (so_error=%d)", addr_string, addr->port, so_err);
+      tcp_socket_close(tcp_socket);
+      return -1;
+    }
+  } else if (ret < 0) {
     LOGE("Failed to connect to server");
     tcp_socket_close(tcp_socket);
     return -1;
@@ -317,12 +356,7 @@ int tcp_socket_connect(TcpSocket* tcp_socket, Address* addr) {
   }
 
   tcp_socket_rx_reset(tcp_socket);
-  {
-    int flags = fcntl(tcp_socket->fd, F_GETFL, 0);
-    if (flags >= 0) {
-      fcntl(tcp_socket->fd, F_SETFL, flags | O_NONBLOCK);
-    }
-  }
+  /* Socket already left in O_NONBLOCK mode from the connect above. */
 
   LOGI("Server is connected");
   return 0;

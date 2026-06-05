@@ -41,6 +41,14 @@ typedef enum AgentMode {
 
 } AgentMode;
 
+/* Mirror of peer_connection.h IceTransportPolicy / IceRelayProtocol. Kept as
+ * plain macros so the low-level agent does not depend on the public header. */
+#define AGENT_ICE_POLICY_ALL 0
+#define AGENT_ICE_POLICY_RELAY 1
+#define AGENT_ICE_RELAY_ANY 0
+#define AGENT_ICE_RELAY_UDP 1
+#define AGENT_ICE_RELAY_TCP 2
+
 typedef struct Agent Agent;
 
 struct Agent {
@@ -71,6 +79,16 @@ struct Agent {
 
   int candidate_pairs_num;
   int use_candidate;
+  /* Controlled agent: set once the controlling peer (browser) sends a Binding
+   * request with USE-CANDIDATE. Until then a controlled agent must NOT finalize
+   * the selected pair from its own rank-based pick, or it can commit to a pair
+   * (e.g. host<->host that succeeds first) the peer later abandons for a relay,
+   * leaving DTLS waiting forever on a path the peer never sends to. */
+  int remote_nominated;
+  /* Controlled agent fallback: epoch-ms deadline after which we stop waiting for
+   * USE-CANDIDATE and accept our own self-selected pair (so a peer that never
+   * trickles a clean nomination still connects). 0 = not armed yet. */
+  uint32_t controlled_nom_deadline;
   uint32_t transaction_id[3];
 
   /* TURN allocation state — ICE checks to relay addrs need Send/Permission. */
@@ -124,6 +142,21 @@ struct Agent {
   uint8_t* media_out;
   int media_out_cap;
   int media_out_len;
+
+  /* ICE behavior policy (mirrors peer_connection.h IceTransportPolicy /
+   * IceRelayProtocol; stored as int to avoid pulling the public header here).
+   *   ice_transport_policy: 0 = ALL, 1 = RELAY-only
+   *   ice_relay_protocol:   0 = ANY, 1 = UDP-only, 2 = TCP-only */
+  int ice_transport_policy;
+  int ice_relay_protocol;
+
+  /* Re-entrancy guard for the TURN send path. agent_turn_send() can be reached
+   * again from inside agent_turn_wait_response() (a relayed Binding request is
+   * dispatched while we wait for a ChannelBind/Refresh reply, and we answer it
+   * via the relay). Without this guard that nests blocking ChannelBind/wait
+   * handshakes and overflows the task stack under connectivity-check bursts.
+   * Depth > 0 means "re-entrant": send best-effort without a blocking handshake. */
+  int turn_send_depth;
 };
 
 void agent_gather_candidate(Agent* agent, const char* urls, const char* username, const char* credential);
@@ -146,6 +179,11 @@ void agent_set_remote_description(Agent* agent, char* description);
 int agent_select_candidate_pair(Agent* agent);
 
 int agent_connectivity_check(Agent* agent);
+
+/** Controlled agent: 1 once it is allowed to finalize the selected pair (the
+ * controlling peer sent USE-CANDIDATE, or the fallback grace period elapsed).
+ * Controlling agents are always ready. */
+int agent_ready_to_finalize(Agent* agent);
 
 void agent_clear_candidates(Agent* agent);
 
