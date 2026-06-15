@@ -182,6 +182,29 @@ int peer_connection_send_video(PeerConnection* pc, const uint8_t* packet, size_t
 /** Drop NACK resends for RTP seq older than the latest IDR (see rtp_nack_cache). */
 void peer_connection_set_nack_discard_pre_idr(PeerConnection* pc, int enable);
 
+/* ---- NACK/RTX retransmit buffer tuning -------------------------------------
+ * The cache keeps the last N outbound RTP packets so an inbound Generic NACK
+ * can be answered with an RTX resend. Deeper buffer = recovers older losses on
+ * lossy links, at N * (CONFIG_MTU+128) bytes of (PSRAM) RAM. Default depth is
+ * RTP_NACK_RING_DEFAULT (512). */
+
+/** Process-wide default depth (packets) for PeerConnections created afterwards.
+ *  0 leaves the current default unchanged; values are clamped to RTP_NACK_RING_MAX. */
+void peer_connection_set_default_nack_buffer_size(unsigned packets);
+
+/** Resize this connection's NACK buffer at runtime (drops buffered history).
+ *  0 -> reset to the process default. Returns 0 on success, -1 on alloc failure. */
+int peer_connection_set_nack_buffer_size(PeerConnection* pc, unsigned packets);
+
+/** Current NACK buffer depth (packets) of this connection (0 if disabled). */
+unsigned peer_connection_get_nack_buffer_size(const PeerConnection* pc);
+
+/** Process-wide / per-connection cap on RTX resends per second (default 500).
+ *  Raising it lets a burst of NACKs recover more packets during a drop, at the
+ *  cost of extra uplink. 0 (per-connection) falls back to the default. */
+void peer_connection_set_default_nack_resend_per_sec(unsigned per_sec);
+void peer_connection_set_nack_resend_per_sec(PeerConnection* pc, unsigned per_sec);
+
 void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp, SdpType sdp_type);
 
 void peer_connection_set_local_description(PeerConnection* pc, const char* sdp, SdpType sdp_type);

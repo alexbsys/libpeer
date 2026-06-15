@@ -591,6 +591,31 @@ void peer_connection_set_nack_discard_pre_idr(PeerConnection* pc, int enable) {
   rtp_nack_cache_set_discard_pre_idr(&pc->nack_cache, enable);
 }
 
+void peer_connection_set_default_nack_buffer_size(unsigned packets) {
+  rtp_nack_cache_set_default_ring_size(packets);
+}
+
+int peer_connection_set_nack_buffer_size(PeerConnection* pc, unsigned packets) {
+  if (!pc) {
+    return -1;
+  }
+  return rtp_nack_cache_resize(&pc->nack_cache, packets);
+}
+
+unsigned peer_connection_get_nack_buffer_size(const PeerConnection* pc) {
+  return pc ? pc->nack_cache.ring_size : 0u;
+}
+
+void peer_connection_set_default_nack_resend_per_sec(unsigned per_sec) {
+  rtp_nack_cache_set_default_resend_per_sec(per_sec);
+}
+
+void peer_connection_set_nack_resend_per_sec(PeerConnection* pc, unsigned per_sec) {
+  if (pc) {
+    rtp_nack_cache_set_resend_per_sec(&pc->nack_cache, per_sec);
+  }
+}
+
 int peer_connection_send_video(PeerConnection* pc, const uint8_t* buf, size_t len, uint32_t pts_us) {
   if (pc->state != PEER_CONNECTION_COMPLETED) {
     // LOGE("dtls_srtp not connected");
