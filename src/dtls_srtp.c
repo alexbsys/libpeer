@@ -15,8 +15,6 @@
 #include "socket.h"
 #include "utils.h"
 
-extern int esp_rom_printf(const char* fmt, ...);
-
 int dtls_srtp_udp_send(void* ctx, const uint8_t* buf, size_t len) {
   DtlsSrtp* dtls_srtp = (DtlsSrtp*)ctx;
   UdpSocket* udp_socket = (UdpSocket*)dtls_srtp->user_data;
@@ -512,7 +510,7 @@ int dtls_srtp_handshake(DtlsSrtp* dtls_srtp, Address* addr) {
   }
 
   if (ret != 0) {
-    esp_rom_printf("DTLSERR mbedtls=-0x%x role=%d\n", (unsigned int)-ret, (int)dtls_srtp->role);
+    PEER_LOG_RAW("DTLSERR mbedtls=-0x%x role=%d\n", (unsigned int)-ret, (int)dtls_srtp->role);
     LOGE("DTLS handshake failed: mbedtls -0x%.4x", (unsigned int)-ret);
     dtls_srtp_handshake_reset(dtls_srtp);
     dtls_srtp->handshaking = 0;

@@ -25,14 +25,15 @@
 /* TEMP freeze-hunt: phase tracker. g_pcl_seq increments once per loop entry;
  * g_pcl_phase is set to a checkpoint id before/after each potentially-blocking
  * call. An independent lock-free heartbeat task (esp_peer_libpeer_default.c)
- * prints these via esp_rom_printf, so if peer_connection_loop() ever stops
+ * prints these via PEER_LOG_RAW, so if peer_connection_loop() ever stops
  * returning, the last phase pinpoints the exact call that hung. Remove once fixed. */
 volatile uint32_t g_pcl_seq = 0;
 volatile uint32_t g_pcl_phase = 0;
 #define PCL(p) do { g_pcl_phase = (uint32_t)(p); } while (0)
 
-/* TEMP freeze-hunt: lock-free UART print (bypasses wedged stdout lock). */
-extern int esp_rom_printf(const char* fmt, ...);
+/* TEMP freeze-hunt: lock-free raw print (bypasses a wedged stdout lock). The
+ * PEER_LOG_RAW macro is resolved per-platform in peer_log.h (esp_rom_printf on
+ * ESP, printf elsewhere); reached here through the utils.h include above. */
 
 struct PeerConnection {
   PeerConfiguration config;
@@ -207,7 +208,7 @@ static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t 
   int iters = 0;
 
   if (handshake_phase) {
-    esp_rom_printf("DTLSRXenter len=%u\n", (unsigned)len);
+    PEER_LOG_RAW("DTLSRXenter len=%u\n", (unsigned)len);
   }
 
   if (pc->agent_ret > 0 && pc->agent_ret <= len) {
@@ -226,7 +227,7 @@ static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t 
         ret = -1;
       } else {
         if (handshake_phase) {
-          esp_rom_printf("DTLSRX got %d B after %d iters\n", ret, iters);
+          PEER_LOG_RAW("DTLSRX got %d B after %d iters\n", ret, iters);
         }
         break;
       }
@@ -239,7 +240,7 @@ static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t 
     }
   }
   if (handshake_phase && ret <= 0) {
-    esp_rom_printf("DTLSRX timeout iters=%d\n", iters);
+    PEER_LOG_RAW("DTLSRX timeout iters=%d\n", iters);
     /* No data this window: tell mbedTLS to wait (and let it drive retransmission
      * via the timer cb) rather than signalling EOF. */
     return MBEDTLS_ERR_SSL_WANT_READ;
@@ -254,7 +255,7 @@ static int peer_connection_dtls_srtp_send(void* ctx, const uint8_t* buf, size_t 
   // LOGD("send %.4x %.4x, %ld", *(uint16_t*)buf, *(uint16_t*)(buf + 2), len);
   int sret = agent_send(&pc->agent, buf, len);
   if (pc->dtls_srtp.handshaking) {
-    esp_rom_printf("DTLSTX sret=%d len=%u ct=%u\n", sret, (unsigned)len,
+    PEER_LOG_RAW("DTLSTX sret=%d len=%u ct=%u\n", sret, (unsigned)len,
                    (len > 0) ? (unsigned)buf[0] : 0u);
   }
   /* mbedTLS's BIO send callback must report the number of *payload* bytes
@@ -462,7 +463,7 @@ static void peer_connection_log_selected_ice(PeerConnection* pc) {
   /* TEMP freeze-hunt: lock-free mirror, survives a wedged stdout lock. */
   uint32_t lip = (uint32_t)pair->local->addr.sin.sin_addr.s_addr;
   uint32_t rip = (uint32_t)pair->remote->addr.sin.sin_addr.s_addr;
-  esp_rom_printf(
+  PEER_LOG_RAW(
       "DTLSPATH selected transport=%s local=%s(%u.%u.%u.%u:%u) "
       "remote=%s(%u.%u.%u.%u:%u) role=%s turn=%d remote_nom=%d\n",
       relay ? (pc->agent.turn_use_tcp ? "relay-tcp" : "relay-udp") : "udp",
@@ -765,7 +766,7 @@ int peer_connection_loop(PeerConnection* pc) {
       {
         int _hs = dtls_srtp_handshake(&pc->dtls_srtp, NULL);
         if (_hs != 1) { /* skip in-progress spam; log only done(0)/fatal(-1) */
-          esp_rom_printf("DTLSHS ret=%d state=%d role=%d\n", _hs, (int)pc->dtls_srtp.state,
+          PEER_LOG_RAW("DTLSHS ret=%d state=%d role=%d\n", _hs, (int)pc->dtls_srtp.state,
                          (int)pc->dtls_srtp.role);
         }
         if (_hs != 0) {

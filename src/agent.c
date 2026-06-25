@@ -17,7 +17,8 @@
 /* TEMP freeze-hunt: shared phase tracker (defined in peer_connection.c). */
 extern volatile uint32_t g_pcl_phase;
 #define PCL(p) do { g_pcl_phase = (uint32_t)(p); } while (0)
-extern int esp_rom_printf(const char* fmt, ...);
+/* Lock-free raw diagnostics; PEER_LOG_RAW is resolved per-platform in peer_log.h
+ * (esp_rom_printf on ESP, printf elsewhere) — see utils.h include above. */
 
 /* Controlled agent grace period (ms) to wait for the controlling peer's
  * USE-CANDIDATE before falling back to our own self-selected pair. */
@@ -68,7 +69,7 @@ static int agent_fault_drop_udp_media(Agent* agent) {
   if (agent->fault_udp_pkts < LIBPEER_FAULT_UDP_KILL_AFTER) {
     agent->fault_udp_pkts++;
     if (agent->fault_udp_pkts == LIBPEER_FAULT_UDP_KILL_AFTER) {
-      esp_rom_printf("FAULTINJECT: UDP media/RTCP throttled to zero after %d pkts\n",
+      PEER_LOG_RAW("FAULTINJECT: UDP media/RTCP throttled to zero after %d pkts\n",
                      (int)LIBPEER_FAULT_UDP_KILL_AFTER);
     }
     return 0;
@@ -769,7 +770,7 @@ static void agent_turn_process_channel_payload(Agent* agent, uint16_t channel, c
 
   if (!agent_turn_channel_to_peer(agent, channel, &peer)) {
     if (!agent->selected_pair) {
-      esp_rom_printf("CHPL unknown ch=0x%04x plen=%d\n", (unsigned)channel, plen);
+      PEER_LOG_RAW("CHPL unknown ch=0x%04x plen=%d\n", (unsigned)channel, plen);
     }
     LOGW("TURN ChannelData unknown ch=0x%04x (%d B)", (unsigned)channel, plen);
     return;
@@ -784,7 +785,7 @@ static void agent_turn_process_channel_payload(Agent* agent, uint16_t channel, c
     inner.size = (size_t)plen;
     stun_parse_msg_buf(&inner);
     if (!agent->selected_pair) {
-      esp_rom_printf("CHPL stun cls=%d mth=%d uc=%d peer=%u:%u\n", (int)inner.stunclass,
+      PEER_LOG_RAW("CHPL stun cls=%d mth=%d uc=%d peer=%u:%u\n", (int)inner.stunclass,
                      (int)inner.stunmethod, (int)inner.use_candidate,
                      (unsigned)((uint32_t)peer.sin.sin_addr.s_addr & 0xff), peer.port);
     }
@@ -1497,21 +1498,21 @@ static int agent_create_turn_addr(Agent* agent, Address* serv_addr, const char* 
   agent->turn_use_tcp = 0;
   if (use_tcp) {
     uint32_t sip = (uint32_t)serv_addr->sin.sin_addr.s_addr;
-    esp_rom_printf("TURNTCP connect -> %u.%u.%u.%u:%u\n", sip & 0xff, (sip >> 8) & 0xff,
+    PEER_LOG_RAW("TURNTCP connect -> %u.%u.%u.%u:%u\n", sip & 0xff, (sip >> 8) & 0xff,
                    (sip >> 16) & 0xff, (sip >> 24) & 0xff, serv_addr->port);
     agent->turn_tcp.fd = -1;
     if (tcp_socket_open(&agent->turn_tcp, serv_addr->family) < 0) {
-      esp_rom_printf("TURNTCP open FAILED\n");
+      PEER_LOG_RAW("TURNTCP open FAILED\n");
       LOGE("TURN/TCP socket open failed");
       return -1;
     }
     if (tcp_socket_connect(&agent->turn_tcp, serv_addr) < 0) {
-      esp_rom_printf("TURNTCP connect FAILED\n");
+      PEER_LOG_RAW("TURNTCP connect FAILED\n");
       tcp_socket_close(&agent->turn_tcp);
       return -1;
     }
     agent->turn_use_tcp = 1;
-    esp_rom_printf("TURNTCP connected ok\n");
+    PEER_LOG_RAW("TURNTCP connected ok\n");
     LOGI("TURN control transport: TCP");
   } else
 #endif
@@ -1534,7 +1535,7 @@ static int agent_create_turn_addr(Agent* agent, Address* serv_addr, const char* 
   ret = agent_turn_control_recv_attempts(agent, &recv_msg,
                                          agent->turn_use_tcp ? AGENT_TURN_TCP_RECV_MAXTIMES
                                                              : AGENT_STUN_RECV_MAXTIMES);
-  esp_rom_printf("TURNTCP alloc1 ret=%d\n", ret);
+  PEER_LOG_RAW("TURNTCP alloc1 ret=%d\n", ret);
   if (ret <= 0) {
     LOGE("Failed to receive TURN Allocate response (ret=%d).", ret);
     goto fail;
@@ -1587,7 +1588,7 @@ static int agent_create_turn_addr(Agent* agent, Address* serv_addr, const char* 
   ret = agent_turn_control_recv_attempts(agent, &recv_msg,
                                          agent->turn_use_tcp ? AGENT_TURN_TCP_RECV_MAXTIMES
                                                              : AGENT_STUN_RECV_MAXTIMES);
-  esp_rom_printf("TURNTCP alloc2 ret=%d\n", ret);
+  PEER_LOG_RAW("TURNTCP alloc2 ret=%d\n", ret);
   if (ret <= 0) {
     LOGD("Failed to receive TURN Allocate success.");
     goto fail;
@@ -1595,7 +1596,7 @@ static int agent_create_turn_addr(Agent* agent, Address* serv_addr, const char* 
 
   stun_parse_msg_buf(&recv_msg);
   if (recv_msg.stunclass != STUN_CLASS_RESPONSE) {
-    esp_rom_printf("TURNTCP alloc2 class=0x%x (not response)\n", recv_msg.stunclass);
+    PEER_LOG_RAW("TURNTCP alloc2 class=0x%x (not response)\n", recv_msg.stunclass);
     LOGE("TURN Allocate failed class=0x%x", recv_msg.stunclass);
     goto fail;
   }
@@ -1626,7 +1627,7 @@ static int agent_create_turn_addr(Agent* agent, Address* serv_addr, const char* 
   addr_to_string(&turn_addr, addr_string, sizeof(addr_string));
   {
     uint32_t rip = (uint32_t)turn_addr.sin.sin_addr.s_addr;
-    esp_rom_printf("TURNTCP allocated relay %u.%u.%u.%u:%u tcp=%d\n", rip & 0xff, (rip >> 8) & 0xff,
+    PEER_LOG_RAW("TURNTCP allocated relay %u.%u.%u.%u:%u tcp=%d\n", rip & 0xff, (rip >> 8) & 0xff,
                    (rip >> 16) & 0xff, (rip >> 24) & 0xff, turn_addr.port, (int)agent->turn_use_tcp);
   }
   LOGI("TURN relay allocated %s:%d (control=%s) lifetime=%u s", addr_string, turn_addr.port,
@@ -1823,7 +1824,7 @@ void agent_process_stun_request(Agent* agent, StunMessage* stun_msg, Address* ad
       const char* req_pwd = agent_stun_password_for_msg(agent, stun_msg);
       int _valid = (stun_msg_is_valid(stun_msg->buf, stun_msg->size, (char*)req_pwd) == 0);
       if (!agent->selected_pair) {
-        esp_rom_printf("STUNREQ valid=%d uc=%d turn=%d user=%s\n", _valid,
+        PEER_LOG_RAW("STUNREQ valid=%d uc=%d turn=%d user=%s\n", _valid,
                        (int)stun_msg->use_candidate, (int)agent->turn_allocated,
                        stun_msg->username[0] ? stun_msg->username : "(none)");
       }
@@ -1848,7 +1849,7 @@ void agent_process_stun_request(Agent* agent, StunMessage* stun_msg, Address* ad
           agent->selected_pair = pair;
           if (!agent->remote_nominated) {
             uint32_t nip = (uint32_t)addr->sin.sin_addr.s_addr;
-            esp_rom_printf("ICEUSECAND remote=%u.%u.%u.%u:%u lt=%d rt=%d\n",
+            PEER_LOG_RAW("ICEUSECAND remote=%u.%u.%u.%u:%u lt=%d rt=%d\n",
                            nip & 0xff, (nip >> 8) & 0xff, (nip >> 16) & 0xff,
                            (nip >> 24) & 0xff, addr->port,
                            pair->local ? (int)pair->local->type : -1,
@@ -1989,7 +1990,7 @@ static int agent_turn_tcp_poll_recv(Agent* agent, StunMessage* stun_msg) {
       int plen = (int)(((uint16_t)frame[2] << 8) | frame[3]);
       if (!agent->selected_pair) {
         int looks_stun = (plen >= 8 && stun_probe(frame + 4, (size_t)plen) == 0) ? 1 : 0;
-        esp_rom_printf("TCPRX ch=0x%04x plen=%d stun=%d\n", channel, plen, looks_stun);
+        PEER_LOG_RAW("TCPRX ch=0x%04x plen=%d stun=%d\n", channel, plen, looks_stun);
       }
       agent_turn_process_channel_payload(agent, channel, frame + 4, plen);
       /* media_out holds ONE relayed payload. Several ChannelData frames (e.g.
@@ -2006,7 +2007,7 @@ static int agent_turn_tcp_poll_recv(Agent* agent, StunMessage* stun_msg) {
     }
     /* STUN control message: parse out of the (512 B) StunMessage buffer. */
     if (!agent->selected_pair) {
-      esp_rom_printf("TCPRX stun ret=%d\n", ret);
+      PEER_LOG_RAW("TCPRX stun ret=%d\n", ret);
     }
     if (ret > (int)sizeof(stun_msg->buf)) {
       continue;

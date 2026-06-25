@@ -7,8 +7,82 @@ RAM/CPU budget of an embedded SoC. This document describes the library as a
 **general-purpose embedded WebRTC building block** — not tied to any particular
 application.
 
-> This is a modified/extended fork of the original `libpeer`. The capability
-> table below reflects *this* fork.
+> This is a modified/extended fork of the original `libpeer`. Everything below
+> describes *this* fork.
+
+## ⭐ What this fork adds (at a glance)
+
+Improvements over upstream `libpeer`, all aimed at **surviving real networks**:
+
+- ✅ **TURN relay over TCP** — `?transport=tcp` allocations with RFC 6062-style
+  ChannelData framing, so media still flows on networks that block UDP entirely.
+- ✅ **Bitrate feedback** — inbound **REMB** (`goog-remb`) and Receiver-Report
+  loss surfaced through callbacks, so the encoder can follow the path.
+- ✅ **RTX retransmission (RFC 4588)** — a real RTX SSRC / payload type with
+  proper `apt` and `ssrc-group:FID` SDP, driven by inbound NACK.
+- ✅ **NACK with a configurable resend buffer** — the last N outbound packets are
+  cached so losses are repaired without a keyframe; depth + resend rate tunable.
+- ✅ **NACK-cache memory management** — the buffer is allocated from PSRAM on ESP
+  (with heap fallback), resizable live, and capped: RAM vs. recovery is a knob.
+- ✅ **PLI / FIR out of the box** — a remote keyframe request arrives as a single
+  "force IDR" callback; no glue code required.
+- ✅ **Improved ICE nomination** — USE-CANDIDATE handled in *both* roles, a
+  controlled-agent grace period before self-nomination, and peer-reflexive
+  promotion, so checks converge reliably across host/srflx/relay paths.
+- ✅ **Platform-agnostic operational logging** — one log shim (`peer_log`) routes
+  to esp_log on ESP-IDF, `printf` elsewhere, or your own sink, plus ICE
+  progress/diagnostics dumps for debugging connectivity in the field.
+- ✅ **Robustness fixes** — TURN allocation refresh / permission re-bind,
+  stale-nonce (438) recovery, candidate-pair table overflow guards, and `.local`
+  mDNS candidates skipped instead of blocking the event loop.
+
+## Why this fork exists — real, interoperable WebRTC
+
+Upstream `libpeer` is an excellent *minimal* WebRTC demonstrator: it sets up a
+session and moves packets when the network is friendly. The goal of this fork is
+different — **genuine interoperability and survivability with real WebRTC
+endpoints (Chrome, Firefox, aiortc, SFUs) on real, hostile networks**, while
+staying inside an embedded RAM/CPU budget.
+
+"Real networks" means packet loss, jitter, variable bandwidth, restrictive NATs
+and UDP-blocking firewalls. An implementation that only works on a clean LAN is
+not enough for a device deployed over LTE, captive Wi-Fi or a corporate network.
+This fork therefore implements the *feedback-and-recovery* half of WebRTC that a
+minimal stack leaves out:
+
+- **Loss recovery without a latency blow-up.** Browsers expect NACK + RTX. This
+  fork keeps a sequence-numbered ring of recently sent packets and answers
+  inbound Generic NACKs with proper RTX packets, so a handful of dropped packets
+  is repaired in well under a frame interval instead of forcing a keyframe or a
+  visible glitch. Ring depth and resend rate are tunable, because the right
+  trade-off between RAM, uplink and recovery depends on the link.
+
+- **Bitrate that follows the path.** A sender that ignores feedback either
+  starves a good link or floods a bad one. This fork surfaces the receiver's
+  REMB estimate and RR loss fraction so the application can drive its encoder to
+  the bandwidth actually available — the single biggest factor in whether video
+  stays watchable as the network degrades.
+
+- **Keyframes when the viewer needs them.** PLI/FIR handling is wired straight to
+  a "produce an intra frame" callback, so recovery from corruption or a late join
+  is immediate and automatic, exactly as every browser expects.
+
+- **A path that exists even when UDP doesn't.** Many networks silently drop UDP.
+  TURN-over-TCP (control *and* relayed media framed as ChannelData) lets the
+  agent still find a working path where a UDP-only implementation simply fails to
+  connect at all.
+
+- **Connectivity you can debug.** ICE failures in the field are notoriously
+  opaque. The fork adds structured ICE progress/diagnostics logging behind a
+  platform-agnostic log shim, so the same code produces useful logs on an ESP32
+  console, on a desktop build, or through a custom sink — without tying the
+  library to any platform.
+
+None of this changes libpeer's character as a small, embeddable C library: the
+additions are feedback, recovery and observability, and every heavy knob (buffer
+depth, relay protocol, transport policy) defaults to something sane and is opt-in
+to tune. The result is a stack that actually completes — and *holds* — a WebRTC
+session against mainstream endpoints over the public Internet.
 
 ## What it can and cannot do
 
@@ -21,6 +95,7 @@ application.
 | **Trickle ICE** | ✅ | Candidates can be added incrementally via `peer_connection_add_ice_candidate()`. |
 | **Transport policy `all` / `relay`** | ✅ | Force relay-only, or allow host+srflx+relay. |
 | **Relay-protocol pinning (UDP-only / TCP-only / any)** | ✅ | Restrict which TURN transport is allocated. |
+| **ICE nomination (USE-CANDIDATE)** | ✅ | Handled in both controlling/controlled roles, with a controlled-agent grace period before self-nomination and peer-reflexive promotion. |
 | **Consent freshness (RFC 7675)** | ⚠️ Partial | Periodic STUN Binding keepalive on the selected pair; no consent-failure-driven re-nomination. |
 | **mDNS (`.local`) remote candidates** | ⛔ Skipped | Intentionally ignored — resolving `.local` blocks the event loop and these candidates are never reachable from outside the LAN anyway. |
 | **DTLS 1.2 + SRTP key export** | ✅ | mbedTLS-based; client or server role. |
@@ -301,3 +376,89 @@ for (;;) {
 handling. Run it from a single dedicated task and call the `send` functions from
 that same task (or serialize access). The callbacks above are invoked from
 inside the loop, so they must not block.
+
+## Logging (platform-agnostic)
+
+libpeer never calls a platform logger directly. All logging funnels through a
+single shim so the library has **no hard dependency on any OS/SDK**:
+
+- The leveled macros `LOGE/LOGW/LOGI/LOGD` (`utils.h`) call `peer_log()`.
+- Hot/hang paths use `PEER_LOG_RAW(...)` — a lock-free raw print that must not
+  take locks or allocate.
+
+The backend is chosen in **one place** (`peer_log.h` / `peer_log.c`):
+
+| Build | `peer_log()` goes to | `PEER_LOG_RAW()` goes to |
+|-------|----------------------|--------------------------|
+| ESP-IDF (`ESP_PLATFORM`) | `esp_log` (tag `"AGENT"`, throttle with `esp_log_level_set`) | `esp_rom_printf` (lock-free ROM UART) |
+| any other target | `printf` (level/file/line prefix) | `printf` |
+| `-DLOG_USE_CUSTOM=1` | **your** `peer_log()` | `printf` (override `PEER_LOG_RAW` before including `peer_log.h`) |
+
+To route libpeer's logs anywhere you like — a ring buffer, syslog, a UI console —
+build with `-DLOG_USE_CUSTOM=1` and provide the sink yourself:
+
+```c
+/* compiled into your app when -DLOG_USE_CUSTOM=1 */
+#include <stdarg.h>
+void peer_log(const char* level_tag, const char* file, int line,
+              const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    my_logger_vprintf(level_tag, file, line, fmt, ap);  /* your sink */
+    va_end(ap);
+}
+```
+
+Compile-time verbosity is set with `-DLOG_LEVEL=LEVEL_DEBUG|INFO|WARN|ERROR`
+(default `INFO`).
+
+For connectivity debugging the agent also exposes structured ICE dumps:
+
+```c
+agent_log_ice_progress(agent, "tag");      /* one-line state: pairs, nominated, turn */
+agent_log_ice_diagnostics(agent, "tag");   /* full candidate/pair table on failure  */
+```
+
+## Host integration tests (ICE + TURN relay)
+
+`tests/host-ice/` is a self-contained desktop test project that runs libpeer's
+**real** ICE agent against a live [coturn](https://github.com/coturn/coturn)
+server. It exists to prove the hard parts on a PC, where they are observable and
+reproducible, before they ship to a device: TURN **Allocate** over UDP *and*
+TCP control, two agents completing ICE over a relay, actual application payloads
+forwarded both directions over the relay, and TURN **refresh/expiry** behaviour.
+
+It is **not built by the normal libpeer build** (embedded or standalone). It is
+a separate CMake project that pulls libpeer in via `add_subdirectory`, so you
+opt in by building it explicitly. It runs on **Ubuntu** natively and on
+**Windows via WSL2 (Ubuntu)**.
+
+### Build & run
+
+```bash
+cd tests/host-ice
+sudo apt install -y build-essential cmake ninja-build coturn   # once
+./scripts/run_tests.sh
+```
+
+`run_tests.sh` configures the project, builds it (the first build downloads
+GoogleTest and compiles libpeer's vendored mbedTLS / libsrtp / usrsctp — a few
+minutes), starts a coturn instance (Docker if available, otherwise a local
+`turnserver`), and runs the cases through `ctest`. Override the TURN endpoint or
+credentials with `TURN_HOST`/`TURN_PORT`/`TURN_USER`/`TURN_PASS`; set
+`ICE_STRESS_ROUNDS=10` to add the repeated UDP+TCP stress run.
+
+### Reading the results
+
+- Each case prints progress lines tagged `[ice-test] <tag> ...`. A run that
+  reaches `... OK at iter=N` succeeded; `... FAIL succeeded=0xN` did not, where
+  the bitmask is `1`=agent A done, `2`=agent B done, `3`=both (the pass
+  condition).
+- On failure the test dumps the full candidate/pair tables via
+  `agent_log_ice_diagnostics` — start there to see which candidates gathered and
+  which pair stalled.
+- Final summary: `ctest` reports per-test `Passed`/`Failed`; the script exits
+  non-zero if any case failed. A common cause of an all-skip run is coturn not
+  listening on `TURN_PORT` (the tests `GTEST_SKIP` when the relay is unreachable).
+
+See `tests/host-ice/README.md` for the full case-by-case table and the manual
+coturn commands.

@@ -77,9 +77,10 @@
 #define CONFIG_IFACE_PREFIX ""
 
 // #define LOG_LEVEL LEVEL_DEBUG
-#ifndef LOG_REDIRECT
-#define LOG_REDIRECT 0
-#endif
+//
+// Logging backend is selected in peer_log.h / peer_log.c (ESP-IDF esp_log on
+// ESP_PLATFORM, plain printf otherwise). Define LOG_USE_CUSTOM=1 to plug in your
+// own peer_log() implementation instead — libpeer stays platform-agnostic.
 
 // Disable MQTT and HTTP signaling
 // #define DISABLE_PEER_SIGNALING 1
