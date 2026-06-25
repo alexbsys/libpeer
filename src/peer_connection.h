@@ -69,12 +69,63 @@ typedef struct IceServer {
 
 } IceServer;
 
+/**
+ * @brief ICE transport policy (mirrors WebRTC RTCIceTransportPolicy).
+ *
+ * RELAY forces all traffic through a TURN relay: host/server-reflexive
+ * local candidates are not gathered and non-relay remote candidates are
+ * ignored when forming pairs.
+ */
+typedef enum IceTransportPolicy {
+  ICE_TRANSPORT_POLICY_ALL = 0,   /* host + srflx + relay (default) */
+  ICE_TRANSPORT_POLICY_RELAY = 1, /* relay candidates only */
+} IceTransportPolicy;
+
+/**
+ * @brief Restrict which TURN relay transport is used during gathering.
+ *
+ * When set to UDP/TCP, TURN servers whose URL transport does not match are
+ * skipped even if they are present in the ICE server list (e.g. force the
+ * device onto TCP relays only). Has no effect on STUN/host candidates.
+ */
+typedef enum IceRelayProtocol {
+  ICE_RELAY_PROTOCOL_ANY = 0, /* use both turn:(udp) and turn:?transport=tcp */
+  ICE_RELAY_PROTOCOL_UDP = 1, /* only allocate UDP relays */
+  ICE_RELAY_PROTOCOL_TCP = 2, /* only allocate TCP relays */
+} IceRelayProtocol;
+
+/**
+ * @brief Snapshot of the currently selected ICE path (debug / status).
+ * Populated by peer_connection_get_ice_info().
+ */
+typedef struct PeerIceInfo {
+  int connected;          /* 1 if a candidate pair has been selected */
+  int via_relay;          /* 1 if the selected pair uses a TURN relay */
+  int relay_over_tcp;     /* 1 if the TURN control transport is TCP */
+  int turn_allocated;     /* 1 if a TURN allocation is currently held */
+  int controlling;        /* 1 if local agent is in CONTROLLING role */
+  int local_type;         /* IceCandidateType of the selected local cand */
+  int remote_type;        /* IceCandidateType of the selected remote cand */
+  int state;              /* PeerConnectionState */
+  int ms_since_rtcp_in;   /* ms since last inbound RTCP (-1 if none seen yet) */
+  const char* local_type_str;  /* "host"/"srflx"/"prflx"/"relay" */
+  const char* remote_type_str;
+  const char* transport_str;   /* "udp"/"relay-udp"/"relay-tcp" */
+  char local_addr[64];    /* "ip:port" of selected local candidate */
+  char remote_addr[64];   /* "ip:port" of selected remote candidate */
+} PeerIceInfo;
+
 typedef struct PeerConfiguration {
   IceServer ice_servers[5];
 
   MediaCodec audio_codec;
   MediaCodec video_codec;
   DataChannelType datachannel;
+
+  /* ICE behavior knobs (see enums above). Zero-initialized config keeps the
+   * historical defaults: ICE_TRANSPORT_POLICY_ALL + ICE_RELAY_PROTOCOL_ANY. */
+  IceTransportPolicy ice_transport_policy;
+  IceRelayProtocol ice_relay_protocol;
 
   void (*onaudiotrack)(uint8_t* data, size_t size, void* userdata);
   void (*onvideotrack)(uint8_t* data, size_t size, void* userdata);
@@ -88,6 +139,13 @@ typedef struct PeerConnection PeerConnection;
 const char* peer_connection_state_to_string(PeerConnectionState state);
 
 PeerConnectionState peer_connection_get_state(PeerConnection* pc);
+
+/**
+ * @brief Fill `info` with a snapshot of the active ICE path (selected pair,
+ *        transport, relay usage, role). Useful for status reporting / tests.
+ * @return 0 on success, -1 on invalid arguments.
+ */
+int peer_connection_get_ice_info(PeerConnection* pc, PeerIceInfo* info);
 
 void* peer_connection_get_sctp(PeerConnection* pc);
 
@@ -124,6 +182,29 @@ int peer_connection_send_video(PeerConnection* pc, const uint8_t* packet, size_t
 /** Drop NACK resends for RTP seq older than the latest IDR (see rtp_nack_cache). */
 void peer_connection_set_nack_discard_pre_idr(PeerConnection* pc, int enable);
 
+/* ---- NACK/RTX retransmit buffer tuning -------------------------------------
+ * The cache keeps the last N outbound RTP packets so an inbound Generic NACK
+ * can be answered with an RTX resend. Deeper buffer = recovers older losses on
+ * lossy links, at N * (CONFIG_MTU+128) bytes of (PSRAM) RAM. Default depth is
+ * RTP_NACK_RING_DEFAULT (512). */
+
+/** Process-wide default depth (packets) for PeerConnections created afterwards.
+ *  0 leaves the current default unchanged; values are clamped to RTP_NACK_RING_MAX. */
+void peer_connection_set_default_nack_buffer_size(unsigned packets);
+
+/** Resize this connection's NACK buffer at runtime (drops buffered history).
+ *  0 -> reset to the process default. Returns 0 on success, -1 on alloc failure. */
+int peer_connection_set_nack_buffer_size(PeerConnection* pc, unsigned packets);
+
+/** Current NACK buffer depth (packets) of this connection (0 if disabled). */
+unsigned peer_connection_get_nack_buffer_size(const PeerConnection* pc);
+
+/** Process-wide / per-connection cap on RTX resends per second (default 500).
+ *  Raising it lets a burst of NACKs recover more packets during a drop, at the
+ *  cost of extra uplink. 0 (per-connection) falls back to the default. */
+void peer_connection_set_default_nack_resend_per_sec(unsigned per_sec);
+void peer_connection_set_nack_resend_per_sec(PeerConnection* pc, unsigned per_sec);
+
 void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp, SdpType sdp_type);
 
 void peer_connection_set_local_description(PeerConnection* pc, const char* sdp, SdpType sdp_type);
@@ -140,6 +221,17 @@ const char* peer_connection_create_answer(PeerConnection* pc);
  */
 void peer_connection_on_receiver_packet_loss(PeerConnection* pc,
                                              void (*on_receiver_packet_loss)(float fraction_loss, uint32_t total_loss, void* userdata));
+
+/**
+ * @brief Register a callback for remote REMB (Receiver Estimated Maximum
+ *        Bitrate, RFC draft "goog-remb") feedback. Fires whenever a valid
+ *        REMB PSFB arrives, with the estimated available bitrate in bps.
+ *
+ * @param[in] pc PeerConnection.
+ * @param[in] on_remb_bitrate callback function (bitrate in bps + userdata).
+ */
+void peer_connection_on_remb(PeerConnection* pc,
+                             void (*on_remb_bitrate)(uint32_t bitrate_bps, void* userdata));
 
 /**
  * @brief Set the callback function to handle onicecandidate event.

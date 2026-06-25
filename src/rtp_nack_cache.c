@@ -17,17 +17,82 @@ static uint16_t rtp_read_seq(const uint8_t* rtp) {
   return (uint16_t)(((uint16_t)rtp[2] << 8) | (uint16_t)rtp[3]);
 }
 
+/* Process-wide defaults; runtime-tunable so a deployment can trade RAM for more
+ * resend history on lossy links without recompiling. A live cache is only
+ * touched by the single rtc-loop task, so set defaults before/between sessions
+ * and resize a connection's cache from that task (see peer_connection API). */
+static unsigned g_default_ring_size = RTP_NACK_RING_DEFAULT;
+static unsigned g_default_resend_per_sec = RTP_NACK_RESEND_PER_SEC_DEFAULT;
+
+static unsigned clamp_ring(unsigned slots) {
+  if (slots == 0) {
+    slots = g_default_ring_size;
+  }
+  if (slots == 0) {
+    slots = RTP_NACK_RING_DEFAULT;
+  }
+  if (slots > RTP_NACK_RING_MAX) {
+    slots = RTP_NACK_RING_MAX;
+  }
+  return slots;
+}
+
+static rtp_nack_slot_t* alloc_slots(unsigned slots) {
+#if defined(ESP_PLATFORM)
+  rtp_nack_slot_t* s = (rtp_nack_slot_t*)heap_caps_calloc(slots, sizeof(rtp_nack_slot_t),
+                                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!s) {
+    s = (rtp_nack_slot_t*)calloc(slots, sizeof(rtp_nack_slot_t));
+  }
+  return s;
+#else
+  return (rtp_nack_slot_t*)calloc(slots, sizeof(rtp_nack_slot_t));
+#endif
+}
+
 static int rate_allow(rtp_nack_cache_t* c) {
   uint32_t now = ports_get_epoch_time();
   if (c->rl_window_start_ms == 0 || (uint32_t)(now - c->rl_window_start_ms) >= 1000u) {
     c->rl_window_start_ms = now;
     c->rl_count = 0;
   }
-  if (c->rl_count >= RTP_NACK_RESEND_PER_SEC) {
+  unsigned cap = c->rl_max_per_sec ? c->rl_max_per_sec : RTP_NACK_RESEND_PER_SEC_DEFAULT;
+  if ((unsigned)c->rl_count >= cap) {
     return 0;
   }
   c->rl_count++;
   return 1;
+}
+
+void rtp_nack_cache_set_default_ring_size(unsigned slots) {
+  if (slots == 0) {
+    return;
+  }
+  if (slots > RTP_NACK_RING_MAX) {
+    slots = RTP_NACK_RING_MAX;
+  }
+  g_default_ring_size = slots;
+}
+
+unsigned rtp_nack_cache_get_default_ring_size(void) {
+  return g_default_ring_size;
+}
+
+void rtp_nack_cache_set_default_resend_per_sec(unsigned per_sec) {
+  if (per_sec == 0) {
+    return;
+  }
+  g_default_resend_per_sec = per_sec;
+}
+
+unsigned rtp_nack_cache_get_default_resend_per_sec(void) {
+  return g_default_resend_per_sec;
+}
+
+void rtp_nack_cache_set_resend_per_sec(rtp_nack_cache_t* c, unsigned per_sec) {
+  if (c) {
+    c->rl_max_per_sec = per_sec;
+  }
 }
 
 void rtp_nack_cache_init(rtp_nack_cache_t* c) {
@@ -35,20 +100,33 @@ void rtp_nack_cache_init(rtp_nack_cache_t* c) {
     return;
   }
   memset(c, 0, sizeof(*c));
-  c->ring_size = RTP_NACK_RING;
-#if defined(ESP_PLATFORM)
-  c->slot = (rtp_nack_slot_t*)heap_caps_calloc(c->ring_size, sizeof(rtp_nack_slot_t),
-                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!c->slot) {
-    c->slot = (rtp_nack_slot_t*)calloc(c->ring_size, sizeof(rtp_nack_slot_t));
-  }
-#else
-  c->slot = (rtp_nack_slot_t*)calloc(c->ring_size, sizeof(rtp_nack_slot_t));
-#endif
+  c->ring_size = clamp_ring(0);
+  c->rl_max_per_sec = g_default_resend_per_sec ? g_default_resend_per_sec : RTP_NACK_RESEND_PER_SEC_DEFAULT;
+  c->slot = alloc_slots(c->ring_size);
   if (!c->slot) {
     LOGW("rtp_nack: alloc(%u slots) failed, NACK cache disabled", (unsigned)c->ring_size);
     c->ring_size = 0;
   }
+}
+
+int rtp_nack_cache_resize(rtp_nack_cache_t* c, unsigned slots) {
+  if (!c) {
+    return -1;
+  }
+  slots = clamp_ring(slots);
+  rtp_nack_slot_t* ns = alloc_slots(slots);
+  if (!ns) {
+    LOGW("rtp_nack: resize(%u slots) failed, cache unchanged", slots);
+    return -1;
+  }
+  free(c->slot);
+  c->slot = ns;
+  c->ring_size = slots;
+  c->rl_window_start_ms = 0;
+  c->rl_count = 0;
+  c->resend_floor_seq = 0;
+  LOGI("rtp_nack: ring resized to %u slots (%u bytes/slot)", slots, (unsigned)sizeof(rtp_nack_slot_t));
+  return 0;
 }
 
 void rtp_nack_cache_deinit(rtp_nack_cache_t* c) {
@@ -164,7 +242,8 @@ int rtp_nack_cache_process_fci(rtp_nack_cache_t* c, const uint8_t* fci, int fci_
       continue;
     }
     if (!rate_allow(c)) {
-      LOGD("rtp_nack: rate limit (%d/s), drop rest", RTP_NACK_RESEND_PER_SEC);
+      LOGD("rtp_nack: rate limit (%u/s), drop rest",
+           c->rl_max_per_sec ? c->rl_max_per_sec : (unsigned)RTP_NACK_RESEND_PER_SEC_DEFAULT);
       break;
     }
     if (send(user, p, plen) >= 0) {

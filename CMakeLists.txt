@@ -1,6 +1,19 @@
 cmake_minimum_required(VERSION 3.16)
 cmake_policy(VERSION 3.16)
 
+# Dual-mode build:
+#   * ESP-IDF       — when IDF_PATH is set (i.e. invoked from idf.py / an IDF
+#                     project), libpeer registers itself as an IDF component and
+#                     returns early. Its third-party deps (mbedtls, srtp, json)
+#                     are provided by IDF managed components.
+#   * Standalone    — otherwise this is a normal CMake project that builds the
+#                     `peer` library plus its vendored deps (mbedtls/libsrtp/
+#                     usrsctp/cJSON) via ExternalProject. Used for desktop builds
+#                     and the host integration tests under tests/host-ice.
+# The logging backend is platform-agnostic in BOTH modes (peer_log.h/.c):
+# esp_log on ESP_PLATFORM, plain printf elsewhere, or a user-supplied peer_log()
+# when -DLOG_USE_CUSTOM=1.
+
 include(${CMAKE_CURRENT_LIST_DIR}/third_party/coreHTTP/httpFilePaths.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/third_party/coreMQTT/mqttFilePaths.cmake)
 
@@ -9,8 +22,12 @@ if (DEFINED ENV{IDF_PATH})
   idf_component_register(
    SRCS ${ESP32_CODES} ${HTTP_SOURCES} ${MQTT_SOURCES} ${MQTT_SERIALIZER_SOURCES}
    INCLUDE_DIRS "./include" "./src" ${HTTP_INCLUDE_PUBLIC_DIRS} ${MQTT_INCLUDE_PUBLIC_DIRS}
-   REQUIRES mbedtls srtp json esp_netif
+   REQUIRES mbedtls srtp json esp_netif log
   )
+  # The logging backend is auto-selected by peer_log.h/.c via ESP_PLATFORM (which
+  # ESP-IDF defines), so no -DLOG_REDIRECT is needed. esp_log stays in REQUIRES
+  # below because peer_log.c routes through it on ESP. To use a custom logger
+  # instead, add -DLOG_USE_CUSTOM=1 here and provide your own peer_log().
   add_definitions("-DCONFIG_USE_LWIP=1" "-DCONFIG_USE_USRSCTP=0" "-DCONFIG_AUDIO_BUFFER_SIZE=8096" "-DCONFIG_DATA_BUFFER_SIZE=102400" "-D__BYTE_ORDER=__LITTLE_ENDIAN" "-DHTTP_DO_NOT_USE_CUSTOM_CONFIG" "-DMQTT_DO_NOT_USE_CUSTOM_CONFIG")
   return()
 endif()

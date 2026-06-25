@@ -30,10 +30,16 @@ typedef enum StunMethod {
 
   STUN_METHOD_BINDING = 0x0001,
   STUN_METHOD_ALLOCATE = 0x0003,
+  STUN_METHOD_REFRESH = 0x0004,
   STUN_METHOD_SEND = 0x0006,
+  STUN_METHOD_DATA = 0x0007,
   STUN_METHOD_CREATE_PERMISSION = 0x0008,
+  STUN_METHOD_CHANNEL_BIND = 0x0009,
 
 } StunMethod;
+
+#define STUN_CHANNEL_NUMBER_MIN 0x4000
+#define STUN_CHANNEL_NUMBER_MAX 0x7FFE
 
 typedef enum StunAttrType {
 
@@ -46,6 +52,8 @@ typedef enum StunAttrType {
   STUN_ATTR_TYPE_XOR_RELAYED_ADDRESS = 0x0016,
   STUN_ATTR_TYPE_XOR_PEER_ADDRESS = 0x0012,
   STUN_ATTR_TYPE_DATA = 0x0013,
+  STUN_ATTR_TYPE_ERROR_CODE = 0x0009,
+  STUN_ATTR_TYPE_CHANNEL_NUMBER = 0x000C,
   STUN_ATTR_TYPE_REQUESTED_TRANSPORT = 0x0019,
   STUN_ATTR_TYPE_XOR_MAPPED_ADDRESS = 0x0020,
   STUN_ATTR_TYPE_PRIORITY = 0x0024,
@@ -101,6 +109,9 @@ struct StunMessage {
   int use_candidate;
   uint8_t data[256];
   int data_len;
+  uint32_t lifetime; /* TURN LIFETIME attribute (seconds), 0 if absent */
+  int error_code;
+  char error_reason[64];
   uint8_t buf[STUN_ATTR_BUF_SIZE];
   size_t size;
 };

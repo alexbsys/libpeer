@@ -58,10 +58,29 @@ typedef struct DtlsSrtp {
   int (*udp_send)(void* ctx, const unsigned char* buf, size_t len);
   int (*udp_recv)(void* ctx, unsigned char* buf, size_t len);
 
+  /* DTLS retransmission timer (per-instance: must NOT be a shared function-static,
+   * or concurrent peers corrupt each other's timer). Configured once together with
+   * the BIO/export-keys callbacks; re-arming set_timer_cb on every handshake step
+   * cancels the retransmit timer, so the I/O setup is gated by io_configured. */
+  mbedtls_timing_delay_context timer;
+  int io_configured;
+
   Address* remote_addr;
 
   DtlsSrtpRole role;
   DtlsSrtpState state;
+
+  /* Non-blocking handshake bookkeeping. dtls_srtp_handshake() is driven once per
+   * peer_connection_loop() iteration (lock released between), so mbedTLS state is
+   * preserved across calls instead of being reset on every read timeout.
+   *  - handshaking: a handshake attempt is in flight; the recv BIO returns
+   *    MBEDTLS_ERR_SSL_WANT_READ on timeout (vs treating no-data as EOF). Cleared
+   *    once the handshake completes so post-handshake reads (datachannel) keep
+   *    their original blocking-with-EOF semantics.
+   *  - handshake_started: one-time per-attempt server setup (session_reset +
+   *    set_client_transport_id) has been done. */
+  int handshaking;
+  int handshake_started;
 
   char local_fingerprint[DTLS_SRTP_FINGERPRINT_LENGTH];
   char remote_fingerprint[DTLS_SRTP_FINGERPRINT_LENGTH];

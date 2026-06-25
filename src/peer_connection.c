@@ -22,6 +22,19 @@
     pc->state = curr_state;                                           \
   }
 
+/* TEMP freeze-hunt: phase tracker. g_pcl_seq increments once per loop entry;
+ * g_pcl_phase is set to a checkpoint id before/after each potentially-blocking
+ * call. An independent lock-free heartbeat task (esp_peer_libpeer_default.c)
+ * prints these via PEER_LOG_RAW, so if peer_connection_loop() ever stops
+ * returning, the last phase pinpoints the exact call that hung. Remove once fixed. */
+volatile uint32_t g_pcl_seq = 0;
+volatile uint32_t g_pcl_phase = 0;
+#define PCL(p) do { g_pcl_phase = (uint32_t)(p); } while (0)
+
+/* TEMP freeze-hunt: lock-free raw print (bypasses a wedged stdout lock). The
+ * PEER_LOG_RAW macro is resolved per-platform in peer_log.h (esp_rom_printf on
+ * ESP, printf elsewhere); reached here through the utils.h include above. */
+
 struct PeerConnection {
   PeerConfiguration config;
   PeerConnectionState state;
@@ -35,6 +48,7 @@ struct PeerConnection {
   void (*oniceconnectionstatechange)(PeerConnectionState state, void* user_data);
   void (*on_connected)(void* userdata);
   void (*on_receiver_packet_loss)(float fraction_loss, uint32_t total_loss, void* user_data);
+  void (*on_remb_bitrate)(uint32_t bitrate_bps, void* user_data);
 
   uint8_t temp_buf[CONFIG_MTU];
   uint8_t agent_buf[CONFIG_MTU];
@@ -57,6 +71,21 @@ struct PeerConnection {
   uint32_t last_pts_us;
   uint32_t rtp_ts_origin_90k;
   int rtp_ts_origin_set;
+
+  /* Outbound RTCP Sender Report (RFC 3550 §6.4.1) for the video SSRC. Counts are
+   * accumulated in the outgoing RTP callback; the report is emitted periodically
+   * from the COMPLETED loop so the browser gets NTP<->RTP anchoring (A/V sync,
+   * accurate getStats) and can echo LSR/DLSR for RTT. */
+  uint32_t vsr_packet_count;
+  uint32_t vsr_octet_count;
+  uint32_t vsr_last_rtp_ts;
+  uint32_t vsr_last_send_ms;
+
+  /* Wall-clock (ms) of the last inbound RTCP packet. A media-path liveness
+   * signal: when we are actively sending video but stop receiving RTCP
+   * (RR/REMB/PLI) the downstream path is likely throttled/dead even if ICE
+   * consent still passes. 0 = no RTCP seen yet. */
+  uint32_t last_rtcp_in_ms;
 };
 
 /* RFC 4588 RTX resend: separate SSRC/PT, OSN + original payload. */
@@ -90,9 +119,66 @@ static int peer_connection_resend_nack_rtp(void* user, const uint8_t* rtp, int l
 
 static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void* user_data) {
   PeerConnection* pc = (PeerConnection*)user_data;
+  /* Tally the video stream for its Sender Report (shared callback also serves
+   * audio, so filter by SSRC). Counts are pre-encryption: packet count and
+   * payload octets (RFC 3550 excludes the 12-byte RTP header), plus the latest
+   * RTP timestamp to anchor the SR's NTP/RTP pair. */
+  if (size >= 12) {
+    const RtpHeader* h = (const RtpHeader*)data;
+    if (ntohl(h->ssrc) == pc->vrtp_encoder.ssrc) {
+      pc->vsr_packet_count++;
+      pc->vsr_octet_count += (uint32_t)(size - 12);
+      pc->vsr_last_rtp_ts = ntohl(h->timestamp);
+    }
+  }
   rtp_nack_cache_store(&pc->nack_cache, data, (int)size);
   dtls_srtp_encrypt_rtp_packet(&pc->dtls_srtp, data, (int*)&size);
   agent_send(&pc->agent, data, size);
+}
+
+/* Emit an RTCP Sender Report for the outbound video SSRC. Cheap: one ~28 B packet
+ * (+SRTCP tag) at PC_SR_INTERVAL_MS. The NTP field uses the monotonic ms clock —
+ * its absolute value need not be real wall time for a single stream; the receiver
+ * echoes the middle 32 bits back via RR for RTT and uses NTP<->RTP to anchor
+ * playout. */
+#define PC_SR_INTERVAL_MS 1000
+
+/* Max inbound packets drained per COMPLETED loop pass. Lets a batched TURN-TCP
+ * burst (RTP + several RTCP) be consumed in one iteration without letting a flood
+ * starve connectivity-check replies. ~30 fps + a handful of RTCP fits well under
+ * this; raise only if a relay ever batches more than this per loop. */
+#define PC_MAX_RX_PER_LOOP 24
+static void peer_connection_send_video_sr(PeerConnection* pc) {
+  uint8_t pkt[64];
+  uint32_t now_ms;
+  uint32_t ntp_sec;
+  uint32_t ntp_frac;
+  int len;
+
+  if (pc->state != PEER_CONNECTION_COMPLETED || pc->vsr_packet_count == 0) {
+    return;
+  }
+
+  now_ms = (uint32_t)ports_get_epoch_time();
+  ntp_sec = now_ms / 1000u;
+  ntp_frac = (uint32_t)(((uint64_t)(now_ms % 1000u) << 32) / 1000u);
+
+  pkt[0] = 0x80;                 /* V=2, P=0, RC=0 */
+  pkt[1] = (uint8_t)RTCP_SR;     /* 200 */
+  pkt[2] = 0x00;                 /* length = 6 (28 bytes / 4 - 1) */
+  pkt[3] = 0x06;
+  *(uint32_t*)(pkt + 4) = htonl(pc->vrtp_encoder.ssrc);
+  *(uint32_t*)(pkt + 8) = htonl(ntp_sec);
+  *(uint32_t*)(pkt + 12) = htonl(ntp_frac);
+  *(uint32_t*)(pkt + 16) = htonl(pc->vsr_last_rtp_ts);
+  *(uint32_t*)(pkt + 20) = htonl(pc->vsr_packet_count);
+  *(uint32_t*)(pkt + 24) = htonl(pc->vsr_octet_count);
+  len = 28;
+
+  dtls_srtp_encrypt_rctp_packet(&pc->dtls_srtp, pkt, &len);
+  if (len > 0) {
+    agent_send(&pc->agent, pkt, len);
+  }
 }
 
 /* RTP/RTCP use version 2 in the top two bits (RFC 3550). Those must not be fed to mbedTLS
@@ -103,30 +189,61 @@ static int peer_connection_looks_like_rtp_or_rtcp(const uint8_t* buf, int n) {
 }
 
 static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t len) {
-  int recv_max = 0;
   int ret = -1;
   DtlsSrtp* dtls_srtp = (DtlsSrtp*)ctx;
   PeerConnection* pc = (PeerConnection*)dtls_srtp->user_data;
-  const int handshake_phase = (dtls_srtp->state != DTLS_SRTP_STATE_CONNECTED);
+  const int handshake_phase = dtls_srtp->handshaking;
+  /* Wall-clock bound for one DTLS read. This callback runs synchronously inside
+   * peer_connection_loop() while the per-peer lock is held, so it must return
+   * promptly to keep the lock free for video/UI/signaling. During the handshake
+   * we return MBEDTLS_ERR_SSL_WANT_READ on timeout (NOT 0 — mbedTLS reads 0 as
+   * connection EOF and aborts): mbedTLS preserves handshake state, the loop
+   * releases the lock, and the next iteration resumes the same handshake so a
+   * multi-datagram flight (e.g. the server flight over a TURN relay) is
+   * accumulated across iterations instead of being reset every timeout. Outside
+   * the handshake (datachannel reads) we keep the original return so callers that
+   * loop on WANT_READ don't spin. */
+  const uint32_t deadline_ms = 200;
+  uint32_t start = (uint32_t)ports_get_epoch_time();
+  int iters = 0;
+
+  if (handshake_phase) {
+    PEER_LOG_RAW("DTLSRXenter len=%u\n", (unsigned)len);
+  }
 
   if (pc->agent_ret > 0 && pc->agent_ret <= len) {
     memcpy(buf, pc->agent_buf, pc->agent_ret);
     return pc->agent_ret;
   }
 
-  while (recv_max < CONFIG_TLS_READ_TIMEOUT && pc->state == PEER_CONNECTION_CONNECTED) {
+  while (pc->state == PEER_CONNECTION_CONNECTED &&
+         (uint32_t)((uint32_t)ports_get_epoch_time() - start) < deadline_ms) {
     ret = agent_recv(&pc->agent, buf, len);
+    iters++;
 
     if (ret > 0) {
       if (handshake_phase && peer_connection_looks_like_rtp_or_rtcp(buf, ret)) {
         LOGD("skip RTP/RTCP (%d B) during DTLS handshake", ret);
         ret = -1;
       } else {
+        if (handshake_phase) {
+          PEER_LOG_RAW("DTLSRX got %d B after %d iters\n", ret, iters);
+        }
         break;
       }
     }
-
-    recv_max++;
+    /* Yield periodically: a STUN/connectivity flood on this socket makes
+     * agent_recv() return immediately every time (no select() wait), which
+     * would CPU-starve video/UI/signaling for the whole deadline. */
+    if ((iters & 0x1f) == 0) {
+      ports_sleep_ms(1);
+    }
+  }
+  if (handshake_phase && ret <= 0) {
+    PEER_LOG_RAW("DTLSRX timeout iters=%d\n", iters);
+    /* No data this window: tell mbedTLS to wait (and let it drive retransmission
+     * via the timer cb) rather than signalling EOF. */
+    return MBEDTLS_ERR_SSL_WANT_READ;
   }
   return ret;
 }
@@ -136,12 +253,27 @@ static int peer_connection_dtls_srtp_send(void* ctx, const uint8_t* buf, size_t 
   PeerConnection* pc = (PeerConnection*)dtls_srtp->user_data;
 
   // LOGD("send %.4x %.4x, %ld", *(uint16_t*)buf, *(uint16_t*)(buf + 2), len);
-  return agent_send(&pc->agent, buf, len);
+  int sret = agent_send(&pc->agent, buf, len);
+  if (pc->dtls_srtp.handshaking) {
+    PEER_LOG_RAW("DTLSTX sret=%d len=%u ct=%u\n", sret, (unsigned)len,
+                   (len > 0) ? (unsigned)buf[0] : 0u);
+  }
+  /* mbedTLS's BIO send callback must report the number of *payload* bytes
+   * accepted, not the wire bytes. agent_send() over a TURN relay returns the
+   * framed size (payload + ChannelData/Send header), which is > len; mbedTLS
+   * treats a return > len as a fault and aborts the handshake. Clamp success to
+   * len (datagram sends are atomic, so sret > 0 means the whole flight went). */
+  if (sret > 0) {
+    return (int)len;
+  }
+  return sret;
 }
 
 static void peer_connection_incoming_rtcp(PeerConnection* pc, uint8_t* buf, size_t len) {
   RtcpHeader* rtcp_header;
   size_t pos = 0;
+
+  pc->last_rtcp_in_ms = (uint32_t)ports_get_epoch_time();
 
   while (pos < len) {
     rtcp_header = (RtcpHeader*)(buf + pos);
@@ -164,6 +296,27 @@ static void peer_connection_incoming_rtcp(PeerConnection* pc, uint8_t* buf, size
         // PLI and FIR
         if ((fmt == 1 || fmt == 4) && pc->config.on_request_keyframe) {
           pc->config.on_request_keyframe(pc->config.user_data);
+        } else if (fmt == 15 && pc->on_remb_bitrate) {
+          /* RFC draft "goog-remb": PSFB (PT=206) with FMT=15. The FCI
+             (offset 12 = 4 hdr + 4 sender SSRC + 4 media SSRC) is:
+               'R','E','M','B'  (4 bytes, unique id)
+               num_ssrc         (1 byte)
+               exp:6 | mantissa:18  (3 bytes, big-endian bitfield)
+               feedback SSRC[]  (4 bytes each)
+             Estimated max bitrate (bps) = mantissa << exp. */
+          size_t block_bytes = 4 * ((size_t)ntohs(rtcp_header->length) + 1u);
+          if (pos + block_bytes <= len && block_bytes >= 12u + 8u) {
+            const uint8_t* fci = buf + pos + 12;
+            if (fci[0] == 'R' && fci[1] == 'E' && fci[2] == 'M' && fci[3] == 'B') {
+              uint8_t exp = (uint8_t)(fci[5] >> 2);
+              uint32_t mantissa = ((uint32_t)(fci[5] & 0x03) << 16) | ((uint32_t)fci[6] << 8) | (uint32_t)fci[7];
+              uint64_t bitrate = (uint64_t)mantissa << exp;
+              if (bitrate > 0xFFFFFFFFull) {
+                bitrate = 0xFFFFFFFFull;
+              }
+              pc->on_remb_bitrate((uint32_t)bitrate, pc->config.user_data);
+            }
+          }
         }
         break;
       }
@@ -219,6 +372,109 @@ PeerConnectionState peer_connection_get_state(PeerConnection* pc) {
   return pc->state;
 }
 
+static const char* peer_ice_candidate_type_str(int type) {
+  switch (type) {
+    case ICE_CANDIDATE_TYPE_HOST:
+      return "host";
+    case ICE_CANDIDATE_TYPE_SRFLX:
+      return "srflx";
+    case ICE_CANDIDATE_TYPE_PRFLX:
+      return "prflx";
+    case ICE_CANDIDATE_TYPE_RELAY:
+      return "relay";
+    default:
+      return "?";
+  }
+}
+
+static void peer_ice_format_addr(const Address* addr, char* out, size_t out_len) {
+  char ip[ADDRSTRLEN];
+  if (!addr) {
+    snprintf(out, out_len, "-");
+    return;
+  }
+  addr_to_string(addr, ip, sizeof(ip));
+  snprintf(out, out_len, "%s:%d", ip, addr->port);
+}
+
+int peer_connection_get_ice_info(PeerConnection* pc, PeerIceInfo* info) {
+  if (!pc || !info) {
+    return -1;
+  }
+  memset(info, 0, sizeof(*info));
+  info->state = pc->state;
+  info->ms_since_rtcp_in = pc->last_rtcp_in_ms
+                               ? (int)((uint32_t)ports_get_epoch_time() - pc->last_rtcp_in_ms)
+                               : -1;
+  info->controlling = (pc->agent.mode == AGENT_MODE_CONTROLLING) ? 1 : 0;
+  info->turn_allocated = pc->agent.turn_allocated ? 1 : 0;
+  info->relay_over_tcp = pc->agent.turn_use_tcp ? 1 : 0;
+  info->local_type_str = "-";
+  info->remote_type_str = "-";
+  info->transport_str = "none";
+  snprintf(info->local_addr, sizeof(info->local_addr), "-");
+  snprintf(info->remote_addr, sizeof(info->remote_addr), "-");
+
+  IceCandidatePair* pair = pc->agent.nominated_pair;
+  if (!pair) {
+    pair = pc->agent.selected_pair;
+  }
+  if (pair && pair->local && pair->remote) {
+    info->connected = 1;
+    info->local_type = pair->local->type;
+    info->remote_type = pair->remote->type;
+    info->local_type_str = peer_ice_candidate_type_str(pair->local->type);
+    info->remote_type_str = peer_ice_candidate_type_str(pair->remote->type);
+    info->via_relay = (pair->local->type == ICE_CANDIDATE_TYPE_RELAY ||
+                       pair->remote->type == ICE_CANDIDATE_TYPE_RELAY)
+                          ? 1
+                          : 0;
+    peer_ice_format_addr(&pair->local->addr, info->local_addr, sizeof(info->local_addr));
+    peer_ice_format_addr(&pair->remote->addr, info->remote_addr, sizeof(info->remote_addr));
+    if (info->via_relay) {
+      info->transport_str = info->relay_over_tcp ? "relay-tcp" : "relay-udp";
+    } else {
+      info->transport_str = "udp";
+    }
+  }
+  return 0;
+}
+
+/* Log the selected ICE path. Reads the pair directly with no large locals so
+ * it adds negligible stack to the (stack-tight) peer_connection_loop() frame
+ * that runs the SDP/gather path. The full address detail stays available via
+ * peer_connection_get_ice_info() for programmatic callers. */
+static void peer_connection_log_selected_ice(PeerConnection* pc) {
+  IceCandidatePair* pair = pc->agent.nominated_pair;
+  if (!pair) {
+    pair = pc->agent.selected_pair;
+  }
+  if (!pair || !pair->local || !pair->remote) {
+    return;
+  }
+  int relay = (pair->local->type == ICE_CANDIDATE_TYPE_RELAY ||
+               pair->remote->type == ICE_CANDIDATE_TYPE_RELAY);
+  LOGI("ICE selected: transport=%s local=%s remote=%s role=%s turn_alloc=%d",
+       relay ? (pc->agent.turn_use_tcp ? "relay-tcp" : "relay-udp") : "udp",
+       peer_ice_candidate_type_str(pair->local->type),
+       peer_ice_candidate_type_str(pair->remote->type),
+       pc->agent.mode == AGENT_MODE_CONTROLLING ? "controlling" : "controlled",
+       pc->agent.turn_allocated);
+  /* TEMP freeze-hunt: lock-free mirror, survives a wedged stdout lock. */
+  uint32_t lip = (uint32_t)pair->local->addr.sin.sin_addr.s_addr;
+  uint32_t rip = (uint32_t)pair->remote->addr.sin.sin_addr.s_addr;
+  PEER_LOG_RAW(
+      "DTLSPATH selected transport=%s local=%s(%u.%u.%u.%u:%u) "
+      "remote=%s(%u.%u.%u.%u:%u) role=%s turn=%d remote_nom=%d\n",
+      relay ? (pc->agent.turn_use_tcp ? "relay-tcp" : "relay-udp") : "udp",
+      peer_ice_candidate_type_str(pair->local->type),
+      lip & 0xff, (lip >> 8) & 0xff, (lip >> 16) & 0xff, (lip >> 24) & 0xff, pair->local->addr.port,
+      peer_ice_candidate_type_str(pair->remote->type),
+      rip & 0xff, (rip >> 8) & 0xff, (rip >> 16) & 0xff, (rip >> 24) & 0xff, pair->remote->addr.port,
+      pc->agent.mode == AGENT_MODE_CONTROLLING ? "controlling" : "controlled",
+      pc->agent.turn_allocated, pc->agent.remote_nominated);
+}
+
 void* peer_connection_get_sctp(PeerConnection* pc) {
   return &pc->sctp;
 }
@@ -236,8 +492,26 @@ PeerConnection* peer_connection_create(PeerConfiguration* config) {
     return NULL;
   }
 
+  /* Propagate ICE behavior policy (relay-only / relay transport) to the agent
+   * so gathering and pairing honor it. */
+  pc->agent.ice_transport_policy = (int)pc->config.ice_transport_policy;
+  pc->agent.ice_relay_protocol = (int)pc->config.ice_relay_protocol;
+  if (pc->agent.ice_transport_policy == AGENT_ICE_POLICY_RELAY ||
+      pc->agent.ice_relay_protocol != AGENT_ICE_RELAY_ANY) {
+    LOGI("ICE policy: transport=%s relay_proto=%s",
+         pc->agent.ice_transport_policy == AGENT_ICE_POLICY_RELAY ? "relay-only" : "all",
+         pc->agent.ice_relay_protocol == AGENT_ICE_RELAY_UDP   ? "udp"
+         : pc->agent.ice_relay_protocol == AGENT_ICE_RELAY_TCP ? "tcp"
+                                                               : "any");
+  }
+
   rtp_nack_cache_init(&pc->nack_cache);
   pc->rtx_seq_number = 1;
+  pc->vsr_packet_count = 0;
+  pc->vsr_octet_count = 0;
+  pc->vsr_last_rtp_ts = 0;
+  pc->vsr_last_send_ms = 0;
+  pc->last_rtcp_in_ms = 0;
 
   memset(&pc->sctp, 0, sizeof(pc->sctp));
 
@@ -316,6 +590,31 @@ void peer_connection_set_nack_discard_pre_idr(PeerConnection* pc, int enable) {
     return;
   }
   rtp_nack_cache_set_discard_pre_idr(&pc->nack_cache, enable);
+}
+
+void peer_connection_set_default_nack_buffer_size(unsigned packets) {
+  rtp_nack_cache_set_default_ring_size(packets);
+}
+
+int peer_connection_set_nack_buffer_size(PeerConnection* pc, unsigned packets) {
+  if (!pc) {
+    return -1;
+  }
+  return rtp_nack_cache_resize(&pc->nack_cache, packets);
+}
+
+unsigned peer_connection_get_nack_buffer_size(const PeerConnection* pc) {
+  return pc ? pc->nack_cache.ring_size : 0u;
+}
+
+void peer_connection_set_default_nack_resend_per_sec(unsigned per_sec) {
+  rtp_nack_cache_set_default_resend_per_sec(per_sec);
+}
+
+void peer_connection_set_nack_resend_per_sec(PeerConnection* pc, unsigned per_sec) {
+  if (pc) {
+    rtp_nack_cache_set_resend_per_sec(&pc->nack_cache, per_sec);
+  }
 }
 
 int peer_connection_send_video(PeerConnection* pc, const uint8_t* buf, size_t len, uint32_t pts_us) {
@@ -431,6 +730,8 @@ static char* peer_connection_dtls_role_setup_value(DtlsSrtpRole d) {
 
 int peer_connection_loop(PeerConnection* pc) {
   uint32_t ssrc = 0;
+  g_pcl_seq++;
+  PCL(1);
   memset(pc->agent_buf, 0, sizeof(pc->agent_buf));
   pc->agent_ret = -1;
 
@@ -439,19 +740,48 @@ int peer_connection_loop(PeerConnection* pc) {
       break;
 
     case PEER_CONNECTION_CHECKING:
+      PCL(10);
       if (agent_select_candidate_pair(&pc->agent) < 0) {
+        PCL(11);
         agent_log_ice_diagnostics(&pc->agent, "select_pair -> FAILED (no usable ICE pair)");
         STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
-      } else if (agent_connectivity_check(&pc->agent) == 0) {
-        LOGI("peer_conn: ICE nominated pair succeeded — starting DTLS-SRTP");
-        STATE_CHANGED(pc, PEER_CONNECTION_CONNECTED);
+      } else {
+        PCL(12);
+        if (agent_connectivity_check(&pc->agent) == 0 &&
+            agent_ready_to_finalize(&pc->agent)) {
+          PCL(13);
+          LOGI("peer_conn: ICE nominated pair succeeded — starting DTLS-SRTP");
+          /* Keep the large PeerIceInfo off this (stack-tight) loop frame — see
+           * peer_connection_log_selected_ice(). */
+          peer_connection_log_selected_ice(pc);
+          STATE_CHANGED(pc, PEER_CONNECTION_CONNECTED);
+        }
       }
+      PCL(14);
       break;
 
     case PEER_CONNECTION_CONNECTED:
 
-      if (dtls_srtp_handshake(&pc->dtls_srtp, NULL) == 0) {
+      PCL(20);
+      {
+        int _hs = dtls_srtp_handshake(&pc->dtls_srtp, NULL);
+        if (_hs != 1) { /* skip in-progress spam; log only done(0)/fatal(-1) */
+          PEER_LOG_RAW("DTLSHS ret=%d state=%d role=%d\n", _hs, (int)pc->dtls_srtp.state,
+                         (int)pc->dtls_srtp.role);
+        }
+        if (_hs != 0) {
+          PCL(22);
+          break;
+        }
+      }
+      {
+        PCL(21);
         LOGI("peer_conn: DTLS-SRTP handshake done — media path ready");
+
+        /* Test-only: arm UDP fault injection now that media is flowing, so the
+         * simulated throttle hits the established stream rather than the
+         * handshake (see LIBPEER_FAULT_INJECT in agent.c). No-op otherwise. */
+        pc->agent.fault_armed = 1;
 
         if (pc->config.datachannel) {
           LOGI("SCTP create socket");
@@ -461,9 +791,21 @@ int peer_connection_loop(PeerConnection* pc) {
 
         STATE_CHANGED(pc, PEER_CONNECTION_COMPLETED);
       }
+      PCL(22);
       break;
     case PEER_CONNECTION_COMPLETED:
-      if ((pc->agent_ret = agent_recv(&pc->agent, pc->agent_buf, sizeof(pc->agent_buf))) > 0) {
+      PCL(30);
+      /* Drain ALL inbound packets buffered this pass, not just one. Over a TURN-
+       * TCP relay several datagrams (notably batched RTCP: RR/REMB/NACK) arrive
+       * in one TCP segment; consuming a single one per loop iteration (the loop
+       * can be ~300 ms on a busy relay) starved inbound RTCP and tripped a false
+       * media stall -> spurious failover. Bounded so a flood can't monopolise the
+       * loop and block connectivity-check replies. */
+      for (int rx = 0; rx < PC_MAX_RX_PER_LOOP; rx++) {
+        if ((pc->agent_ret = agent_recv(&pc->agent, pc->agent_buf, sizeof(pc->agent_buf))) <= 0) {
+          break;
+        }
+        PCL(31);
         LOGD("agent_recv %d", pc->agent_ret);
 
         if (rtcp_probe(pc->agent_buf, pc->agent_ret)) {
@@ -501,6 +843,11 @@ int peer_connection_loop(PeerConnection* pc) {
         STATE_CHANGED(pc, PEER_CONNECTION_CLOSED);
       }
 
+      if ((uint32_t)((uint32_t)ports_get_epoch_time() - pc->vsr_last_send_ms) >= PC_SR_INTERVAL_MS) {
+        pc->vsr_last_send_ms = (uint32_t)ports_get_epoch_time();
+        peer_connection_send_video_sr(pc);
+      }
+
       break;
     case PEER_CONNECTION_FAILED:
       break;
@@ -512,6 +859,7 @@ int peer_connection_loop(PeerConnection* pc) {
       break;
   }
 
+  PCL(99);
   return 0;
 }
 
@@ -764,7 +1112,9 @@ static const char* peer_connection_create_sdp(PeerConnection* pc, SdpType sdp_ty
 
   pc->b_local_description_created = 1;
 
-  agent_gather_candidate(&pc->agent, NULL, NULL, NULL);  // host address
+#if !CONFIG_ICE_RELAY_ONLY
+  agent_gather_candidate(&pc->agent, NULL, NULL, NULL);
+#endif
 
   if (sdp_type == SDP_TYPE_ANSWER) {
     /* Emit the answer immediately with host candidates only; STUN/TURN round-trips
@@ -843,6 +1193,11 @@ void peer_connection_on_connected(PeerConnection* pc, void (*on_connected)(void*
 void peer_connection_on_receiver_packet_loss(PeerConnection* pc,
                                              void (*on_receiver_packet_loss)(float fraction_loss, uint32_t total_loss, void* userdata)) {
   pc->on_receiver_packet_loss = on_receiver_packet_loss;
+}
+
+void peer_connection_on_remb(PeerConnection* pc,
+                             void (*on_remb_bitrate)(uint32_t bitrate_bps, void* userdata)) {
+  pc->on_remb_bitrate = on_remb_bitrate;
 }
 
 void peer_connection_onicecandidate(PeerConnection* pc, void (*onicecandidate)(char* sdp, void* userdata)) {
