@@ -1,0 +1,7 @@
+services:
+  coturn:
+    image: coturn/coturn:4.6.2
+    network_mode: host
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+    command: ["-c", "/etc/coturn/turnserver.conf"]
