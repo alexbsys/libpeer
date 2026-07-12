@@ -161,6 +161,12 @@ struct Agent {
   int media_out_cap;
   int media_out_len;
 
+  /* One-slot stash for relayed media read while media_out is unset (e.g. the
+   * TURN-TCP send path drains the socket for STUN/TX flush). Without this,
+   * inbound SCTP/datachannel frames are dropped as "no app buffer / overflow". */
+  uint8_t turn_pending_media[1400];
+  int turn_pending_media_len;
+
   /* ICE behavior policy (mirrors peer_connection.h IceTransportPolicy /
    * IceRelayProtocol; stored as int to avoid pulling the public header here).
    *   ice_transport_policy: 0 = ALL, 1 = RELAY-only

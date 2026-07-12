@@ -142,6 +142,7 @@ void agent_clear_candidates(Agent* agent) {
   agent->turn_cp_pending = 0;
   agent->turn_cb_pending = 0;
   agent->turn_cb_ok = 0;
+  agent->turn_pending_media_len = 0;
   memset(agent->turn_cp_tid, 0, sizeof(agent->turn_cp_tid));
   memset(agent->turn_cb_tid, 0, sizeof(agent->turn_cb_tid));
   memset(&agent->turn_server, 0, sizeof(agent->turn_server));
@@ -763,6 +764,18 @@ static int agent_addr_is_turn_server(const Agent* agent, const Address* addr) {
   return strcmp(sa, sb) == 0;
 }
 
+static int agent_media_stash(Agent* agent, const uint8_t* payload, int plen) {
+  if (!agent || !payload || plen <= 0) {
+    return -1;
+  }
+  if (agent->turn_pending_media_len > 0 || plen > (int)sizeof(agent->turn_pending_media)) {
+    return -1;
+  }
+  memmove(agent->turn_pending_media, payload, (size_t)plen);
+  agent->turn_pending_media_len = plen;
+  return 0;
+}
+
 static void agent_turn_process_channel_payload(Agent* agent, uint16_t channel, const uint8_t* payload,
                                                int plen) {
   Address peer;
@@ -798,6 +811,8 @@ static void agent_turn_process_channel_payload(Agent* agent, uint16_t channel, c
     memmove(agent->media_out, payload, (size_t)plen);
     agent->media_out_len = plen;
     LOGD("TURN ChannelData %d B media from peer %s:%d -> app", plen, peer_str, peer.port);
+  } else if (plen > 0 && agent_media_stash(agent, payload, plen) == 0) {
+    LOGD("TURN ChannelData %d B media stashed (no app buffer)", plen);
   } else if (plen > 0) {
     LOGW("TURN ChannelData %d B media dropped (no app buffer / overflow)", plen);
   }
@@ -1210,15 +1225,12 @@ static int agent_turn_send_inner(Agent* agent, Address* peer, const uint8_t* dat
       addr_to_string(peer, ps, sizeof(ps));
       LOGI("TURN ChannelData %d B -> %s:%d ch=0x%04x", len, ps, peer->port, (unsigned)channel);
       if (agent->turn_use_tcp) {
-        StunMessage drain_msg;
         ret = stun_tcp_send_channel_data(&agent->turn_tcp, channel, data, len);
-        memset(&drain_msg, 0, sizeof(drain_msg));
-        for (int d = 0; d < 16; d++) {
-          if (!agent_turn_tcp_poll_recv(agent, &drain_msg)) {
-            break;
-          }
-          memset(&drain_msg, 0, sizeof(drain_msg));
-        }
+        /* Flush any partial TX tail only — do NOT drain inbound ChannelData here.
+         * This runs inside mbedTLS's send callback; agent->media_out is unset, so
+         * reading inbound relayed media would drop SCTP/datachannel frames (see the
+         * UDP ChannelData path below). agent_recv() picks up inbound media. */
+        (void)tcp_socket_tx_flush(&agent->turn_tcp);
         return ret;
       }
       ret = agent_turn_udp_send_channel_data(agent, channel, data, len);
@@ -1936,6 +1948,8 @@ static void agent_process_inbound_stun(Agent* agent, StunMessage* stun_msg, Addr
           memcpy(agent->media_out, stun_msg->data, (size_t)stun_msg->data_len);
           agent->media_out_len = stun_msg->data_len;
           LOGD("TURN Data indication %d B media -> app", stun_msg->data_len);
+        } else if (agent_media_stash(agent, stun_msg->data, stun_msg->data_len) == 0) {
+          LOGD("TURN Data indication %d B media stashed (no app buffer)", stun_msg->data_len);
         } else {
           LOGW("TURN indication media dropped (%d bytes, no app buffer/overflow)", stun_msg->data_len);
         }
@@ -2061,6 +2075,13 @@ int agent_recv(Agent* agent, uint8_t* buf, int len) {
   int ret = -1;
   StunMessage stun_msg;
   Address addr;
+
+  if (agent->turn_pending_media_len > 0 && len >= agent->turn_pending_media_len) {
+    memmove(buf, agent->turn_pending_media, (size_t)agent->turn_pending_media_len);
+    ret = agent->turn_pending_media_len;
+    agent->turn_pending_media_len = 0;
+    goto done;
+  }
 
   /* Expose the caller buffer to the TURN receive path so relayed non-STUN media
    * (ChannelData / Data indication) can be delivered back to the application. */
