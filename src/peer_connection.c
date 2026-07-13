@@ -86,6 +86,19 @@ struct PeerConnection {
    * (RR/REMB/PLI) the downstream path is likely throttled/dead even if ICE
    * consent still passes. 0 = no RTCP seen yet. */
   uint32_t last_rtcp_in_ms;
+
+  /* Cooperative outbound-RTP pacing hook. A fat IDR (~230 FU-A packets) is sent
+   * synchronously from the video-bus task while the esp_peer transport mutex is
+   * held, which blocks the rtc_loop task from servicing SCTP -> the HID
+   * datachannel freezes for ~1 s and then bursts. When set, this callback is
+   * invoked every `rtp_pacing_every` outbound RTP packets so the transport layer
+   * can briefly drop+reacquire its mutex and let the loop task run. The callback
+   * MUST return with all shared state exactly as it was (i.e. only yield); it is
+   * called between whole packets when no encoder/SRTP state is mid-update. */
+  void (*rtp_pacing_cb)(void* user_data);
+  void* rtp_pacing_user;
+  uint16_t rtp_pacing_every;
+  uint16_t rtp_pacing_count;
 };
 
 /* RFC 4588 RTX resend: separate SSRC/PT, OSN + original payload. */
@@ -134,6 +147,18 @@ static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void
   rtp_nack_cache_store(&pc->nack_cache, data, (int)size);
   dtls_srtp_encrypt_rtp_packet(&pc->dtls_srtp, data, (int*)&size);
   agent_send(&pc->agent, data, size);
+
+  /* Cooperative pacing: after every Nth whole packet, let the transport layer
+   * yield so the SCTP/datachannel loop isn't starved for the full frame send.
+   * Safe here — the packet is fully emitted and no encoder/SRTP state is
+   * mid-update (the counter is per-connection and free-running across frames,
+   * so a fat IDR is guaranteed to cross several pacing points). */
+  if (pc->rtp_pacing_cb && pc->rtp_pacing_every) {
+    if (++pc->rtp_pacing_count >= pc->rtp_pacing_every) {
+      pc->rtp_pacing_count = 0;
+      pc->rtp_pacing_cb(pc->rtp_pacing_user);
+    }
+  }
 }
 
 /* Emit an RTCP Sender Report for the outbound video SSRC. Cheap: one ~28 B packet
@@ -590,6 +615,16 @@ void peer_connection_set_nack_discard_pre_idr(PeerConnection* pc, int enable) {
     return;
   }
   rtp_nack_cache_set_discard_pre_idr(&pc->nack_cache, enable);
+}
+
+void peer_connection_set_rtp_pacing(PeerConnection* pc, void (*cb)(void* user_data), void* user_data, unsigned every_packets) {
+  if (!pc) {
+    return;
+  }
+  pc->rtp_pacing_cb = cb;
+  pc->rtp_pacing_user = user_data;
+  pc->rtp_pacing_every = (uint16_t)(every_packets > 0xFFFFu ? 0xFFFFu : every_packets);
+  pc->rtp_pacing_count = 0;
 }
 
 void peer_connection_set_default_nack_buffer_size(unsigned packets) {

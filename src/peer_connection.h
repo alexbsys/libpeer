@@ -182,6 +182,16 @@ int peer_connection_send_video(PeerConnection* pc, const uint8_t* packet, size_t
 /** Drop NACK resends for RTP seq older than the latest IDR (see rtp_nack_cache). */
 void peer_connection_set_nack_discard_pre_idr(PeerConnection* pc, int enable);
 
+/**
+ * @brief Install a cooperative pacing callback invoked every `every_packets`
+ *        outbound RTP packets during a frame send. Lets the transport layer
+ *        (esp_peer) briefly release its peer mutex mid-frame so a large IDR
+ *        does not starve the SCTP/datachannel loop. cb==NULL disables pacing.
+ *        The callback is invoked between whole packets (no encoder/SRTP state
+ *        is mid-update) and must only yield, leaving shared state untouched.
+ */
+void peer_connection_set_rtp_pacing(PeerConnection* pc, void (*cb)(void* user_data), void* user_data, unsigned every_packets);
+
 /* ---- NACK/RTX retransmit buffer tuning -------------------------------------
  * The cache keeps the last N outbound RTP packets so an inbound Generic NACK
  * can be answered with an RTX resend. Deeper buffer = recovers older losses on
