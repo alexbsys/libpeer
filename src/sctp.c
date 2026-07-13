@@ -124,7 +124,7 @@ int sctp_outgoing_data(Sctp* sctp, char* buf, size_t len, SctpDataPpid ppid, uin
 
   chunk->type = SCTP_DATA;
   chunk->iube = 0x06;
-  chunk->sid = htons(0);
+  chunk->sid = htons(sid);
   chunk->sqn = htons(sqn++);
   chunk->ppid = htonl(ppid);
 
